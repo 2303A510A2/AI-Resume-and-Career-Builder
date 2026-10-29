@@ -1,0 +1,9 @@
+# Secrets & environment — never commit real credentials (works alongside root .gitignore)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Node
+node_modules/
+*.log

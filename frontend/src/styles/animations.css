@@ -1,0 +1,31 @@
+/* ============ Animation system ============ */
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes slideDown { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes scaleIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-14px); }
+}
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.75; }
+  50% { opacity: 1; }
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+@keyframes typingBounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
+
+/* Utility classes (used in markup) */
+.fade-in { animation: fadeIn 0.5s ease both; }
+.slide-up { animation: slideUp 0.5s ease both; }
+.scale-in { animation: scaleIn 0.4s ease both; }
+.fade-up { animation: slideUp 0.5s ease both; }
+.floating { animation: float 5s ease-in-out infinite; }
+
+/* Entrance delays for grids */
+.fade-up:nth-child(2) { animation-delay: 0.06s; }
+.fade-up:nth-child(3) { animation-delay: 0.12s; }
+.fade-up:nth-child(4) { animation-delay: 0.18s; }
+.fade-up:nth-child(5) { animation-delay: 0.24s; }
+.fade-up:nth-child(6) { animation-delay: 0.3s; }
