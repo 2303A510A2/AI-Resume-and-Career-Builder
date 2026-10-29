@@ -184,7 +184,7 @@ const login = async (req, res) => {
   await user.save();
   await audit.record({ actor: user, req, action: 'admin.login' });
 
-  res.json({ success: true, token: issueAdminToken(user), admin: publicAdmin(user) });
+  return res.status(200).json({ success: true, token: issueAdminToken(user), admin: publicAdmin(user) });
 };
 
 // @desc   Submit an admin-access request (verified by credentials; grants NOTHING)

@@ -80,7 +80,7 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
-        sync: false
+        value: https://ai-resume-and-career-builder-1.onrender.com/api
     routes:
       - type: rewrite
         source: /*

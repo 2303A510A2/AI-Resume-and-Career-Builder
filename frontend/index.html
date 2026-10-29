@@ -1380,6 +1380,12 @@ var VITE_API_URL = (typeof window !== "undefined" && (window.APP_API_BASE || win
 var BACKEND_ORIGIN = "http://localhost:5000";
 var DEV_API_URL = (function () {
   if (/^https?:\/\//i.test(VITE_API_URL)) return VITE_API_URL;
+  /* The Render legacy deployment can serve this file without Vite injecting
+     VITE_API_URL. Keep the API target explicit in that deployment so a
+     relative /api request cannot be answered by the static frontend host. */
+  if (window.location && window.location.hostname === "ai-resume-and-career-builder-2.onrender.com") {
+    return "https://ai-resume-and-career-builder-1.onrender.com/api";
+  }
   if (window.location && window.location.protocol === "https:" && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") return "";
   var host = (window.location && window.location.hostname) || "";
   if (host === "127.0.0.1" || host === "0.0.0.0") return "http://127.0.0.1:5000/api";
@@ -1790,7 +1796,12 @@ function apiCall(path, payload, opts) {
     .then(function (r) {
       noteBackendAlive();
       done();
-      return r.json().catch(function () { return null; }).then(function (data) {
+      var contentType = String(r.headers.get("content-type") || "").toLowerCase();
+      return r.text().then(function (text) {
+        var data = null;
+        if (text.trim() && contentType.indexOf("application/json") !== -1) {
+          try { data = JSON.parse(text); } catch (parseErr) { data = null; }
+        }
         if (!r.ok) {
           var e = new Error((data && (data.message || data.error)) || ("Request failed (" + r.status + ")"));
           e.code = r.status;
@@ -1801,7 +1812,7 @@ function apiCall(path, payload, opts) {
         /* HTTP 200 whose body was not JSON: a broken proxy/gateway, NOT an
            answer. Previously this silently rendered an EMPTY AI bubble, which
            looks like "the AI does not reply" instead of an honest error. */
-        if (!data || typeof data !== "object") {
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
           var be = new Error("The backend returned an unreadable response.");
           be.code = r.status;
           be.unreadable = true;
@@ -1863,7 +1874,12 @@ function apiUpload(path, formData) {
     .then(function (r) {
       noteBackendAlive();
       done();
-      return r.json().catch(function () { return null; }).then(function (data) {
+      var contentType = String(r.headers.get("content-type") || "").toLowerCase();
+      return r.text().then(function (text) {
+        var data = null;
+        if (text.trim() && contentType.indexOf("application/json") !== -1) {
+          try { data = JSON.parse(text); } catch (parseErr) { data = null; }
+        }
         if (!r.ok) {
           var e = new Error((data && (data.message || data.error)) || ("Upload failed (" + r.status + ")"));
           e.code = r.status;
@@ -1871,7 +1887,7 @@ function apiUpload(path, formData) {
           if (data && data.retryable !== undefined) e.retryable = data.retryable;
           throw e;
         }
-        if (!data || typeof data !== "object") {
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
           var ue = new Error("The backend returned an unreadable response.");
           ue.code = r.status;
           ue.unreadable = true;

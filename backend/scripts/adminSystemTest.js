@@ -46,7 +46,9 @@ const api = async (method, p, { token, body } = {}) => {
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  return { status: r.status, body: await j(r) };
+  const contentType = String(r.headers.get('content-type') || '').toLowerCase();
+  const responseBody = await j(r);
+  return { status: r.status, contentType, body: responseBody };
 };
 
 const registerUser = async (label) => {
@@ -80,6 +82,23 @@ const main = async () => {
     console.log('      start it first (`node server.js` in backend/, or root `npm run dev`).');
     process.exit(1);
   }
+
+  const missingCredentials = await api('POST', '/admin/login', { body: {} });
+  check(
+    'admin login missing credentials returns JSON 400',
+    missingCredentials.status === 400 && missingCredentials.contentType.includes('application/json')
+      && missingCredentials.body.code === undefined
+      && typeof missingCredentials.body.message === 'string'
+  );
+  const incorrectCredentials = await api('POST', '/admin/login', {
+    body: { email: ADMIN_EMAIL, password: `${ADMIN_PASSWORD}-wrong` },
+  });
+  check(
+    'admin login incorrect password returns JSON 401',
+    incorrectCredentials.status === 401
+      && incorrectCredentials.contentType.includes('application/json')
+      && incorrectCredentials.body.code === 'INVALID_CREDENTIALS'
+  );
 
   if (!MONGO_URI) {
     console.log('FAIL  MONGO_URI is required for cleanup/restore.');
@@ -122,6 +141,7 @@ const main = async () => {
     }
     let adminToken = login.body.token;
     const mainAdminId = String(login.body.admin._id);
+    check('main admin login returns JSON', login.contentType.includes('application/json') && login.body && typeof login.body === 'object');
     check('main admin login works with the initial credentials', login.status === 200 && !!adminToken);
     check('login response contains NO password field', !hasKey(login.body, 'password'));
     const wasGated = login.body.admin.mustChangePassword === true;
