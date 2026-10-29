@@ -620,12 +620,16 @@ node scripts/realAiTest.js         # REAL-provider verification (needs a working
 
 ## Deployment
 
-### Frontend (Vercel)
-1. Push the repo to GitHub and import it into Vercel (framework preset: **Vite**).
+### Frontend (Render Static Site or Vercel)
+1. For Render, create a **Static Site** from this repository with root directory
+   `frontend`, build command `npm install && npm run build`, and publish directory
+   `dist`. The checked-in `render.yaml` defines this service automatically.
+   Vercel is also supported with the existing `vercel.json`.
 2. `vercel.json` already sets `buildCommand: npm --prefix frontend run build`,
    `outputDirectory: frontend/dist`, and SPA rewrites to `react-app.html`
    (the React app; the chat-first `index.html` is the local dev interface).
-3. Environment variable (Vercel → Project → Settings → Environment Variables):
+3. Set this environment variable in the frontend hosting dashboard
+   (Render/Vercel → Environment Variables):
    `VITE_API_URL=https://<your-render-app>.onrender.com/api`.
    Vite inlines it at build time, so add it **before** each production build.
    This is **required**: a production build without `VITE_API_URL` refuses to
@@ -654,10 +658,10 @@ node scripts/realAiTest.js         # REAL-provider verification (needs a working
    `INITIAL_ADMIN_PASSWORD` and
    `EMAIL_HOST`/`EMAIL_PORT`. Do NOT set `PORT`: Render injects it (the backend
    binds `process.env.PORT || 5000`).
-3. The server binds `process.env.PORT || 5000` and stays online during brief
-   MongoDB outages, so Render's health check and zero-downtime restarts work.
-   `GET /api/health` always answers HTTP 200 with the real DB/AI state in the
-   body — it never depends on the AI provider or MongoDB being up.
+3. The server binds `0.0.0.0:<PORT>` on Render and stays running while the
+   MongoDB retry loop attempts recovery. `GET /api/health` returns HTTP 200 only
+   when MongoDB is connected and HTTP 503 with the real disconnected state
+   otherwise, so Render cannot mark a database-disconnected service healthy.
 
 ### Database (MongoDB Atlas)
 1. Create a free M0 cluster → Database Access (user) → Network Access (allow
