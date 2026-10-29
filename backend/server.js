@@ -35,6 +35,7 @@ const aiRoutes = require('./routes/aiRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
+const { validateAuthConfig } = require('./utils/authConfig');
 
 const app = express();
 
@@ -275,6 +276,15 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 5000;
 
 const start = async () => {
+  try {
+    validateAuthConfig();
+  } catch (err) {
+    console.error(`❌ Authentication configuration invalid: ${err.message}`);
+    console.error('   Set the missing variables in the backend service environment and restart it.');
+    process.exitCode = 1;
+    return;
+  }
+
   // Safe startup diagnostics for the AI provider. The API key is NEVER printed.
   {
     const ai = llmService.describe();

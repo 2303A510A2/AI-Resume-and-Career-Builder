@@ -6,6 +6,7 @@ const { generateToken, generateResetToken } = require('../utils/generateToken');
 const { isValidEmail, isValidPassword, sanitizeUser } = require('../utils/validators');
 const { sendOTPEmail } = require('../services/emailService');
 const jwt = require('jsonwebtoken');
+const { getResetSecret } = require('../utils/authConfig');
 
 const OTP_TTL_MINUTES = 10;
 const OTP_MAX_ATTEMPTS = 5;
@@ -219,8 +220,15 @@ const resetPassword = async (req, res) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(resetToken, process.env.JWT_RESET_SECRET);
+    decoded = jwt.verify(resetToken, getResetSecret());
   } catch {
+    if (!String(process.env.JWT_RESET_SECRET || '').trim()) {
+      return res.status(503).json({
+        success: false,
+        code: 'AUTH_CONFIG_MISSING',
+        message: 'Password reset is temporarily unavailable. Please contact support.',
+      });
+    }
     return res.status(400).json({ success: false, message: 'Reset token is invalid or expired. Please request a new OTP.' });
   }
 

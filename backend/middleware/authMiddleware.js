@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Admin = require('../models/Admin');
+const { getAuthSecret } = require('../utils/authConfig');
 
 // Verifies the Bearer token. Returns `{ ok: true, decoded }` or
 // `{ ok: false, code }` where `code` says WHY it failed:
@@ -19,9 +20,12 @@ const attachUser = (req) => {
     return { ok: false, code: 'TOKEN_MISSING' };
   }
   try {
-    const decoded = jwt.verify(header.slice(7).trim(), process.env.JWT_SECRET);
+    const decoded = jwt.verify(header.slice(7).trim(), getAuthSecret());
     return { ok: true, decoded };
   } catch (err) {
+    if (err && err.code === 'AUTH_CONFIG_MISSING') {
+      return { ok: false, code: 'AUTH_CONFIG_MISSING' };
+    }
     if (err && err.name === 'TokenExpiredError') {
       return { ok: false, code: 'TOKEN_EXPIRED', expiredAt: err.expiredAt };
     }
@@ -42,6 +46,7 @@ const protect = async (req, res, next) => {
       TOKEN_MISSING: 'Not authorized, token missing or invalid',
       TOKEN_EXPIRED: 'Session expired, please sign in again',
       TOKEN_INVALID: 'Not authorized, token missing or invalid',
+      AUTH_CONFIG_MISSING: 'Authentication is temporarily unavailable. Please contact support.',
     };
     return res.status(401).json({
       success: false,
