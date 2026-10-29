@@ -136,6 +136,22 @@ npm run dev              # http://localhost:5173
 
 `VITE_API_URL` points the SPA at the backend (`http://localhost:5000/api`).
 
+For the Render deployment, set the frontend service variable to
+`https://ai-resume-and-career-builder-1.onrender.com/api` and set the backend
+service's `CLIENT_URL` and/or `FRONTEND_URL` to the exact deployed frontend
+origin. The backend trusts exactly one Render reverse-proxy hop for
+`express-rate-limit`; it does not trust arbitrary forwarded proxy chains.
+
+The Main Admin Leader is bootstrapped only from backend environment variables:
+`INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, and optionally
+`INITIAL_ADMIN_NAME`. If no Main Admin Leader exists, the backend creates one
+with the initial password marked for mandatory change. If the configured email
+already belongs to an ordinary user, that existing record is promoted once
+server-side. If a Main Admin Leader already exists, bootstrap does nothing and
+never resets its password. The legacy `ADMIN_*` names remain supported as a
+local/backward-compatible fallback, but new Render deployments should use the
+`INITIAL_ADMIN_*` names explicitly. Never put these values in frontend code.
+
 In dev every application route (`/`, `/dashboard`, `/dashboard/career-assistant`,
 `/react-app.html`) serves the React SPA, so deep links work on a plain reload; the
 legacy single-file demo stays available at `/index.html` and `/legacy`. Production

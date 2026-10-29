@@ -38,6 +38,13 @@ const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 
 const app = express();
 
+// Render places one trusted reverse proxy in front of the Node process. Trust
+// exactly that hop so Express can derive req.ip for rate limiting from
+// X-Forwarded-For without trusting an arbitrary client-supplied proxy chain.
+// Do not use `true` here: that would let a caller spoof the address used by
+// express-rate-limit and bypass the per-IP limits.
+app.set('trust proxy', 1);
+
 // ---- Security middleware ----
 app.use(helmet());
 

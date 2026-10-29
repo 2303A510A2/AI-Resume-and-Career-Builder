@@ -62,6 +62,14 @@ services:
         sync: false
       - key: ADMIN_NAME
         sync: false
+      # One-time Main Admin Leader bootstrap. The backend never reads these
+      # values from a request and never overwrites an existing main admin.
+      - key: INITIAL_ADMIN_NAME
+        sync: false
+      - key: INITIAL_ADMIN_EMAIL
+        sync: false
+      - key: INITIAL_ADMIN_PASSWORD
+        sync: false
       - key: ADMIN_JWT_EXPIRES_IN
         value: 8h
       - key: JWT_EXPIRES_IN

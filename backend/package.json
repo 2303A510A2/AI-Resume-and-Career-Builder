@@ -8,6 +8,7 @@
     "dev": "nodemon server.js",
     "smoke": "node scripts/smokeTest.js",
     "test:cors": "node scripts/corsOfflineTest.js",
+    "test:server-config": "node scripts/serverConfigTest.js",
     "test:chat-path": "node scripts/chatPathTest.js",
     "test:offline-port": "node scripts/portConflictTest.js",
     "test:output": "node scripts/outputRequirementsTest.js",
