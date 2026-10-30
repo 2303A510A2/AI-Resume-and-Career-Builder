@@ -325,21 +325,24 @@ const main = async () => {
 
   console.log('\n11b) A temporary continuation rate limit resumes automatically');
   {
-    const first = Array.from({ length: 77 }, (_, i) => `${i + 1}. LeetCode problem ${i + 1}`).join('\n');
-    const rest = Array.from({ length: 23 }, (_, i) => `${i + 78}. LeetCode problem ${i + 78}`).join('\n');
     const limited = new Error('temporary provider rate limit');
     limited.code = 'AI_RATE_LIMITED';
     limited.retryable = true;
     limited.rateLimitKind = 'tokens';
-    const r = await runChat({ question: 'give me 100 LeetCode problems', replies: [first, rest], failSequence: [null, limited] });
-    ok('a temporary continuation rate limit does not lose the partial answer', r.error === null && /problem 77\b/.test(r.answer));
-    ok('automatic retry resumes at the next missing item', /problem 78\b/.test(r.answer) && /problem 100\b/.test(r.answer), `calls=${r.calls.length}`);
-    const numbers = [...r.answer.matchAll(/^\s*(\d+)\./gm)].map((m) => Number(m[1]));
-    ok('automatic retry preserves continuous numbering without duplicates',
-      numbers.length === 100 && numbers.every((n, i) => n === i + 1) && new Set(numbers).size === 100,
-      `${numbers.length} numbered items`);
-    ok('automatic retry reports complete 100/100 progress', r.completion && r.completion.complete === true
-      && r.completion.produced === 100 && r.completion.target === 100, JSON.stringify(r.completion));
+    for (const cutAt of [40, 77]) {
+      const first = Array.from({ length: cutAt }, (_, i) => `${i + 1}. LeetCode problem ${i + 1}`).join('\n');
+      const rest = Array.from({ length: 100 - cutAt }, (_, i) => `${i + cutAt + 1}. LeetCode problem ${i + cutAt + 1}`).join('\n');
+      const r = await runChat({ question: 'give me 100 LeetCode problems', replies: [first, rest], failSequence: [null, limited] });
+      const label = `after item ${cutAt}`;
+      ok(`temporary rate limit ${label} keeps partial output`, r.error === null && r.answer.includes(`problem ${cutAt}`));
+      ok(`automatic retry ${label} resumes at the next item`, r.answer.includes(`problem ${cutAt + 1}`) && /problem 100\b/.test(r.answer), `calls=${r.calls.length}`);
+      const numbers = [...r.answer.matchAll(/^\s*(\d+)\./gm)].map((m) => Number(m[1]));
+      ok(`automatic retry ${label} preserves numbering without duplicates`,
+        numbers.length === 100 && numbers.every((n, i) => n === i + 1) && new Set(numbers).size === 100,
+        `${numbers.length} numbered items`);
+      ok(`automatic retry ${label} reports complete 100/100 progress`, r.completion && r.completion.complete === true
+        && r.completion.produced === 100 && r.completion.target === 100, JSON.stringify(r.completion));
+    }
   }
 
   console.log('\n12) A fully complete answer costs exactly ONE provider call');

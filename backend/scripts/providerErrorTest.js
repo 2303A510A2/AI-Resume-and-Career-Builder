@@ -69,6 +69,8 @@ process.env.LLM_BASE_URL = 'https://api.groq.com/openai/v1';
 process.env.LLM_MODEL = 'openai/gpt-oss-20b';
 process.env.LLM_API_KEY = FAKE_KEY;
 process.env.LLM_MAX_RETRIES = '2';
+process.env.LLM_INPUT_TOKEN_LIMIT = '8000';
+process.env.LLM_OUTPUT_TOKEN_LIMIT = '1000';
 process.env.NODE_ENV = 'test'; // dev logs ON (asserted below), never production
 delete process.env.PROVIDER_LOG; // ...and not opted out
 
@@ -98,6 +100,21 @@ const ok = (name, cond, detail = '') => {
     say(`  FAIL ${name}${detail ? ' :: ' + detail : ''}`);
   }
 };
+
+const oversizedHistory = [
+  { role: 'system', content: 'SYSTEM '.repeat(1200) },
+  ...Array.from({ length: 8 }, (_, i) => ({
+    role: i % 2 ? 'assistant' : 'user',
+    content: `${i} ${'history '.repeat(1200)}`,
+  })),
+  { role: 'user', content: 'What is Java? Explain it simply.' },
+];
+const fitted = llmService.fitMessagesToInputLimit(oversizedHistory, 8000);
+const fittedTokens = fitted.reduce((sum, message) => sum + llmService.estimateContentTokens(message.content) + 4, 0);
+ok('input context is reduced to the configured 8,000-token limit', fittedTokens <= 8000, `estimated=${fittedTokens}`);
+ok('the current user request survives input trimming', fitted[fitted.length - 1].content.includes('What is Java?'));
+ok('Groq output budget is capped at the configured 1,000-token limit',
+  llmService.providerTokenLimits({ provider: 'groq', baseUrl: 'https://api.groq.com/openai/v1' }).output === 1000);
 
 // ---- Stubbed provider transport ------------------------------------------------
 const http = (status, payload, headers = {}) => {
@@ -331,9 +348,10 @@ const main = async () => {
     ok('a transient network failure is retried, but bounded (2 calls)', net.calls.length === 2, `${net.calls.length} call(s)`);
     ok('AI_UNREACHABLE stays retryable', net.error && net.error.retryable === true, `retryable=${net.error && net.error.retryable}`);
 
-    const good = await runChat({ respond: () => okReply('STUB ANSWER') });
+    const good = await runChat({ respond: () => okReply('STUB ANSWER'), maxTokens: 1400 });
     ok('a 200 succeeds on the first call', good.error === null && good.content === 'STUB ANSWER', good.error ? good.error.message : `${good.calls.length} call(s)`);
     ok('a 200 costs exactly one provider call', good.calls.length === 1, `${good.calls.length} call(s)`);
+    ok('a 1,400-token request is capped at Groq output limit 1,000', good.calls[0].maxTokens === 1000, `max_tokens=${good.calls[0].maxTokens}`);
     ok('[AI RESPONSE] status=200 log carries provider + model only (§12)', good.logs.some((l) => /^\[AI RESPONSE\] status=200 provider=groq model=openai\/gpt-oss-20b/.test(l)), (good.logs.find((l) => /^\[AI RESPONSE\]/.test(l)) || '(no [AI RESPONSE] line)').slice(0, 140));
     ok('[AI PROVIDER RESPONSE] trace logs status=200 with the requestId (§1)', good.logs.some((l) => /^\[AI PROVIDER RESPONSE\] requestId=offline-test-rid status=200/.test(l)), (good.logs.find((l) => /^\[AI PROVIDER RESPONSE\]/.test(l)) || '(no response line)').slice(0, 120));
   }

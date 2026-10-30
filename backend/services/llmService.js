@@ -71,6 +71,100 @@ const EMPTY_RESPONSE_BUDGET_CAP = 32768; // max_tokens ceiling when retrying an 
 // provider 400 when we over-ask.
 const MAX_OUTPUT_TOKENS = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 32768);
 const MIN_OUTPUT_TOKENS = 64;
+const DEFAULT_GROQ_INPUT_TOKEN_LIMIT = 8000;
+const DEFAULT_GROQ_OUTPUT_TOKEN_LIMIT = 1000;
+const DEFAULT_GENERIC_INPUT_TOKEN_LIMIT = 32768;
+
+const estimateContentTokens = (content) => {
+  if (Array.isArray(content)) {
+    return Math.ceil(content.reduce((sum, part) => sum + estimateContentTokens(
+      part && (part.text || part.image_url && part.image_url.url || '')
+    ), 0));
+  }
+  return Math.ceil(String(content || '').length / 4);
+};
+
+const estimateMessageTokens = (message) =>
+  4 + estimateContentTokens(message && message.content);
+
+const providerTokenLimits = (cfg) => {
+  const isGroq = String(cfg && cfg.provider || '').toLowerCase() === 'groq'
+    || /api\.groq\.com/i.test(String(cfg && cfg.baseUrl || ''));
+  const inputLimit = Number(
+    process.env.LLM_INPUT_TOKEN_LIMIT
+      || process.env.LLM_INPUT_TPM_LIMIT
+      || (isGroq ? DEFAULT_GROQ_INPUT_TOKEN_LIMIT : DEFAULT_GENERIC_INPUT_TOKEN_LIMIT)
+  );
+  const outputLimit = Number(
+    process.env.LLM_OUTPUT_TOKEN_LIMIT
+      || process.env.LLM_OUTPUT_TPM_LIMIT
+      || (isGroq ? DEFAULT_GROQ_OUTPUT_TOKEN_LIMIT : MAX_OUTPUT_TOKENS)
+  );
+  return {
+    input: Math.max(256, Math.floor(inputLimit)),
+    output: Math.max(MIN_OUTPUT_TOKENS, Math.min(MAX_OUTPUT_TOKENS, Math.floor(outputLimit))),
+  };
+};
+
+const truncateMessageContent = (content, maxChars, keepTail = false) => {
+  if (Array.isArray(content)) return content;
+  const text = String(content || '');
+  if (text.length <= maxChars) return content;
+  const marker = '\n[Earlier context trimmed to fit the provider input limit.]\n';
+  const available = Math.max(0, maxChars - marker.length);
+  return keepTail
+    ? marker + text.slice(-available)
+    : text.slice(0, available) + marker;
+};
+
+/**
+ * Keeps the system prompt and current user request, then retains the newest
+ * context that fits the provider's input-token limit. This is deliberately
+ * performed immediately before every fetch so retries cannot resend an
+ * oversized prompt.
+ */
+const fitMessagesToInputLimit = (messages, inputLimit) => {
+  const source = Array.isArray(messages) ? messages : [];
+  if (!source.length) return [];
+  const system = source[0];
+  const latest = source[source.length - 1];
+  const middle = source.slice(1, -1);
+  const result = [];
+  const latestReserve = Math.min(
+    estimateMessageTokens(latest),
+    Math.max(32, Math.floor(inputLimit * 0.4))
+  );
+  let remaining = Math.max(1, inputLimit - latestReserve);
+
+  const add = (message, keepTail = false) => {
+    const cost = estimateMessageTokens(message);
+    if (cost <= remaining) {
+      result.push(message);
+      remaining -= cost;
+      return true;
+    }
+    if (typeof message.content !== 'string' || remaining <= 32) return false;
+    const maxChars = Math.max(64, (remaining - 4) * 4);
+    const trimmed = { ...message, content: truncateMessageContent(message.content, maxChars, keepTail) };
+    if (estimateMessageTokens(trimmed) <= remaining) {
+      result.push(trimmed);
+      remaining -= estimateMessageTokens(trimmed);
+      return true;
+    }
+    return false;
+  };
+
+  add(system);
+  for (let i = middle.length - 1; i >= 0; i -= 1) {
+    if (!add(middle[i], middle[i].role === 'assistant')) break;
+  }
+  remaining += latestReserve;
+  add(latest, false);
+  const first = result[0];
+  const last = result[result.length - 1];
+  const selectedMiddle = result.slice(1, -1).reverse();
+  return first === last ? result : [first, ...selectedMiddle, last];
+};
 
 // Provider reachability probe (GET /models). Groq's /models list is routinely
 // slower than 5s under Node/undici (observed ~9.5s) while chat completions stay
@@ -561,9 +655,10 @@ const attemptWithProvider = async (cfg, {
   const startedAt = Date.now();
   const reqTag = requestId ? `requestId=${requestId} ` : '';
   const total = retries + 1;
+  const limits = providerTokenLimits(cfg);
   // Output budget actually requested by the caller (never above the absolute
   // ceiling) — this is what the per-attempt timeout is sized from.
-  const requestedBudget = clampInt(maxTokens, MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS);
+  const requestedBudget = clampInt(maxTokens, MIN_OUTPUT_TOKENS, limits.output);
   // Per-attempt wall clock scales with that budget (see perAttemptTimeoutMs), and
   // the total request deadline is derived from it so the two can never disagree.
   const attemptTimeoutMs = perAttemptTimeoutMs(requestedBudget);
@@ -595,9 +690,9 @@ const attemptWithProvider = async (cfg, {
 
     const body = {
       model: cfg.model,
-      messages,
+      messages: fitMessagesToInputLimit(messages, limits.input),
       temperature,
-      max_tokens: tokenBudget,
+      max_tokens: Math.min(tokenBudget, limits.output),
       ...(typeof onDelta === 'function' ? { stream: true } : {}),
     };
     if (Array.isArray(tools) && tools.length) {
@@ -1514,6 +1609,9 @@ module.exports = {
   // Budget/timeout introspection (used by the deterministic budget tests).
   perAttemptTimeoutMs,
   maxOutputTokensCeiling: () => MAX_OUTPUT_TOKENS,
+  providerTokenLimits,
+  estimateContentTokens,
+  fitMessagesToInputLimit,
   // 429 classification introspection (used by providerErrorTest): which KIND of
   // rate limit a provider body really is, and how it maps to a client error.
   rateLimitKind,
