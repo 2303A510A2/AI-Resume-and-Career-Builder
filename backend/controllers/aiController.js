@@ -190,7 +190,16 @@ const imageClientJSON = (generated) => ({
   isFollowUp: Boolean(generated.doc.isFollowUp),
 });
 
-const handleCareerAssistant = async ({ req, userId, message, conversationId, documentIds, forceImage = false }) => {
+const handleCareerAssistant = async ({
+  req,
+  userId,
+  message,
+  conversationId,
+  documentIds,
+  forceImage = false,
+  onDelta,
+  abortSignal,
+}) => {
   // ---- Conversation (created or continued; always owned) ----
   // A brand-new chat is only persisted AFTER the AI succeeds, so a missing
   // AI key never leaves an orphan/empty conversation behind.
@@ -330,6 +339,8 @@ const handleCareerAssistant = async ({ req, userId, message, conversationId, doc
     // The authenticated user's saved chat preferences (response style, preferred
     // language). These shape the answer but never override an explicit request.
     preferences: (req.userRecord && req.userRecord.settings && req.userRecord.settings.chat) || {},
+    onDelta,
+    abortSignal,
   });
 
   // ---- Persist ----
@@ -368,6 +379,129 @@ const careerAssistant = async (req, res) => {
   );
 
   res.json({ ...payload, requestId: rid, deduped: Boolean(deduped) });
+};
+
+const sseEvent = (res, event, data) => {
+  if (res.writableEnded || res.destroyed) return false;
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  return true;
+};
+
+const persistPartialStream = async ({ userId, message, conversationId, content, requestId, stopped }) => {
+  if (!String(content || '').trim()) return null;
+  const chat = await resolveConversation({ userId, conversationId, message });
+  chat.messages.push({ role: 'user', content: String(message), requestId });
+  chat.messages.push({
+    role: 'assistant',
+    content: String(content),
+    completion: {
+      complete: false,
+      kind: 'none',
+      reason: 'The response ended before completion.',
+      stopped,
+      providerTruncated: true,
+    },
+    requestId,
+  });
+  await chat.save();
+  return buildResponse({
+    answer: String(content),
+    completion: chat.messages[chat.messages.length - 1].completion,
+    resources: [],
+    sources: [],
+    intent: 'GENERAL',
+    mode: 'stream',
+    chunkCount: 0,
+    sections: [],
+  }, chat);
+};
+
+// Additive streaming endpoint. The existing JSON endpoint remains unchanged.
+// Events are JSON-encoded so clients can evolve without parsing provider output:
+// start {requestId}, delta {text}, complete {response,requestId,deduped},
+// error {code,message,retryable}, cancelled {response}.
+const careerAssistantStream = async (req, res) => {
+  const { message, conversationId, documentIds, requestId } = req.body || {};
+  if (!message || !String(message).trim()) {
+    return res.status(400).json({ success: false, code: 'MESSAGE_REQUIRED', message: 'Message is required' });
+  }
+
+  const userId = req.user.id;
+  const rid = String(requestId || '').trim() || crypto.randomUUID();
+  req.requestId = rid;
+  const abortController = new AbortController();
+  let disconnected = false;
+  let partial = '';
+  const onClose = () => {
+    if (!res.writableEnded) {
+      disconnected = true;
+      abortController.abort();
+    }
+  };
+  res.once('close', onClose);
+
+  res.status(200);
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  sseEvent(res, 'start', { requestId: rid });
+
+  try {
+    const result = await requestDedup.runOnce(`${userId}:${rid}`, () =>
+      handleCareerAssistant({
+        req,
+        userId,
+        message: String(message),
+        conversationId,
+        documentIds,
+        onDelta: async (text) => {
+          partial += String(text || '');
+          if (!disconnected) sseEvent(res, 'delta', { text: String(text || '') });
+        },
+        abortSignal: abortController.signal,
+      })
+    );
+    const payload = { ...result.payload, requestId: rid, deduped: Boolean(result.deduped) };
+    if (!disconnected) {
+      if (payload.message?.content && payload.message.content !== partial) {
+        sseEvent(res, 'replace', { text: payload.message.content });
+      }
+      sseEvent(res, 'complete', { response: payload, requestId: rid, deduped: Boolean(result.deduped) });
+      res.end();
+    }
+  } catch (err) {
+    if (partial && !disconnected) {
+      try {
+        const partialPayload = await persistPartialStream({
+          userId,
+          message,
+          conversationId,
+          content: partial,
+          requestId: rid,
+          stopped: abortController.signal.aborted ? 'cancelled' : 'stream_error',
+        });
+        if (partialPayload) sseEvent(res, 'replace', { text: partialPayload.message.content });
+      } catch (persistErr) {
+        console.warn(`[AI] streaming partial persistence failed code=${persistErr.code || 'error'}`);
+      }
+    }
+    if (!disconnected) {
+      sseEvent(res, abortController.signal.aborted ? 'cancelled' : 'error', {
+        code: String(err?.code || 'AI_STREAM_ERROR'),
+        message: abortController.signal.aborted
+          ? 'Generation stopped. The partial answer was preserved.'
+          : (err?.isOperational ? String(err.message) : 'The AI response could not be completed.'),
+        retryable: err?.retryable !== false,
+      });
+      res.end();
+    }
+  } finally {
+    res.removeListener('close', onClose);
+  }
 };
 
 // @desc   Dedicated real image generation. Used by the composer/regenerate
@@ -565,6 +699,7 @@ const speech = async (req, res) => {
 
 module.exports = {
   careerAssistant,
+  careerAssistantStream,
   regenerateMessage,
   generateImage,
   getGeneratedImage,

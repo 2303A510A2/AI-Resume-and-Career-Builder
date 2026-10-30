@@ -146,9 +146,11 @@ The Main Admin Leader is bootstrapped only from backend environment variables:
 `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, and optionally
 `INITIAL_ADMIN_NAME`. If no Main Admin Leader exists, the backend creates one
 with the initial password marked for mandatory change. If the configured email
-already belongs to an ordinary user, that existing record is promoted once
-server-side. If a Main Admin Leader already exists, bootstrap does nothing and
-never resets its password. The legacy `ADMIN_*` names remain supported as a
+already belongs to an ordinary user, bootstrap stops without changing that
+account's role, password, or status. An operator must choose a different
+bootstrap email or perform an explicit, audited recovery operation. If a Main
+Admin Leader already exists, bootstrap does nothing and never resets its
+password. The legacy `ADMIN_*` names remain supported as a
 local/backward-compatible fallback, but new Render deployments should use the
 `INITIAL_ADMIN_*` names explicitly. Never put these values in frontend code.
 

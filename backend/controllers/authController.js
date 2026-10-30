@@ -3,7 +3,7 @@ const Admin = require('../models/Admin');
 const OTP = require('../models/OTP');
 const { generateOTP, verifyOTP } = require('../utils/generateOTP');
 const { generateToken, generateResetToken } = require('../utils/generateToken');
-const { isValidEmail, isValidPassword, sanitizeUser } = require('../utils/validators');
+const { isValidEmail, isValidPassword, normalizeEmail, emailLookup, sanitizeUser } = require('../utils/validators');
 const { sendOTPEmail } = require('../services/emailService');
 const jwt = require('jsonwebtoken');
 const { getResetSecret } = require('../utils/authConfig');
@@ -30,12 +30,13 @@ const register = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Passwords do not match' });
   }
 
-  const exists = await User.findOne({ email: email.toLowerCase() });
+  const normalizedEmail = normalizeEmail(email);
+  const exists = await User.findOne(emailLookup(normalizedEmail));
   if (exists) {
     return res.status(409).json({ success: false, message: 'An account with this email already exists' });
   }
 
-  const user = await User.create({ name: name.trim(), email: email.toLowerCase(), password });
+  const user = await User.create({ name: name.trim(), email: normalizedEmail, password });
   const token = generateToken(user);
   res.status(201).json({ success: true, token, user: sanitizeUser(user) });
 };
@@ -48,7 +49,7 @@ const login = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
 
-  const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
+  const user = await User.findOne(emailLookup(email)).select('+password');
   if (!user || !(await user.matchPassword(password))) {
     return res.status(401).json({ success: false, message: 'Invalid email or password' });
   }
@@ -119,9 +120,9 @@ const forgotPassword = async (req, res) => {
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, message: 'A valid email is required' });
   }
-  const normalizedEmail = email.toLowerCase();
+  const normalizedEmail = normalizeEmail(email);
 
-  const user = await User.findOne({ email: normalizedEmail });
+  const user = await User.findOne(emailLookup(normalizedEmail));
   if (!user) {
     // Generic response - never reveal whether an account exists.
     return res.json({
@@ -169,7 +170,7 @@ const verifyOtp = async (req, res) => {
     return res.status(400).json({ success: false, message: 'Email and OTP are required' });
   }
 
-  const record = await OTP.findOne({ email: email.toLowerCase(), purpose: 'reset-password' });
+  const record = await OTP.findOne({ email: normalizeEmail(email), purpose: 'reset-password' });
   if (!record) {
     return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
   }
@@ -193,7 +194,7 @@ const verifyOtp = async (req, res) => {
     });
   }
 
-  const user = await User.findOne({ email: record.email });
+  const user = await User.findOne(emailLookup(record.email));
   if (!user) {
     return res.status(404).json({ success: false, message: 'Account not found' });
   }
@@ -252,7 +253,7 @@ const adminLogin = async (req, res) => {
   if (!isValidEmail(email) || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
-  const admin = await Admin.findOne({ email: email.toLowerCase() }).select('+password');
+  const admin = await Admin.findOne(emailLookup(email)).select('+password');
   if (!admin || !(await admin.matchPassword(password))) {
     return res.status(401).json({ success: false, message: 'Invalid admin email or password' });
   }

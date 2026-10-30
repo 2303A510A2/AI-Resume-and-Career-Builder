@@ -726,7 +726,13 @@ const main = async () => {
       /if \(!question \|\| sendingRef\.current\) return;/.test(react));
     ok('React: the flag is raised BEFORE any await (StrictMode/double-click safe)',
       /sendingRef\.current = true;\s*\n\s*setSending\(true\);/.test(react) &&
-      react.indexOf('sendingRef.current = true;') < react.indexOf('sendChatMessage(question'));
+      react.indexOf('sendingRef.current = true;') < Math.min(
+        ...['streamChatMessage(question', 'sendChatMessage(question']
+          .map((needle) => {
+            const index = react.indexOf(needle);
+            return index < 0 ? Number.MAX_SAFE_INTEGER : index;
+          })
+      ));
     ok('React: the flag is released when the response settles',
       /sendingRef\.current = false;\s*\n\s*setSending\(false\);/.test(react));
     ok('React: Enter preventDefaults instead of submitting twice',

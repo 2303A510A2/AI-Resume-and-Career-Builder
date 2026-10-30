@@ -23,6 +23,7 @@ const {
   mergeContinuation,
   wordCount,
   numberedRuns,
+  numberedProgress,
   bulletCount,
 } = require('../services/outputRequirements');
 
@@ -140,6 +141,17 @@ console.log('\n7) Completeness check — detects the classic cut-short answers')
 
   const full = Array.from({ length: 10 }, (_, i) => `Table ${i + 1}\n${i + 1} x 1 = ${i + 1}`).join('\n\n');
   ok('all 10 tables -> complete', checkCompleteness(full, req('give multiplication tables from 1 to 10')).complete);
+
+  const progress = numberedProgress('**1.** first\n2: second\n2: repeated\n4. fourth');
+  eq('progress preserves unique numbered markers', progress.numbers, [1, 2, 4]);
+  eq('progress reports duplicate markers', progress.duplicates, [2]);
+  eq('progress reports missing markers', progress.missing, [3]);
+  const duplicate = checkCompleteness(
+    '1. first\n2. second\n2. repeated\n3. third',
+    req('give 3 interview questions')
+  );
+  ok('duplicate markers are not treated as complete progress', !duplicate.complete, JSON.stringify(duplicate));
+  eq('duplicate progress is surfaced', duplicate.duplicates, [2]);
 
   // 20 problems where the model returned 12.
   const p12 = Array.from({ length: 12 }, (_, i) => `${i + 1}. Problem ${i + 1}`).join('\n');
@@ -295,6 +307,12 @@ console.log('\n9) Merge: continuation never duplicates or restarts');
   // A continuation with a REAL new numbered item must NOT be glued mid-line.
   const nextItems = mergeContinuation(cutRow, '21: next row 21 products');
   ok('a new numbered colon row is NOT glued onto the previous line', nextItems.includes('200\n\n21: next row 21 products'), nextItems.slice(-60));
+
+  const boldRestart = mergeContinuation('**1.** alpha\n**2.** beta', '**1.** alpha\n**2.** beta\n**3.** gamma');
+  ok('bold numbered restart drops repeated items', (boldRestart.match(/\*\*1\.\*\*/g) || []).length === 1, boldRestart);
+
+  const colonRestart = mergeContinuation('1: alpha\n2: beta', '1: alpha\n2: beta\n3: gamma');
+  ok('colon numbered restart drops repeated rows', colonRestart === '1: alpha\n2: beta\n\n3: gamma', colonRestart);
 }
 
 console.log('\n10) The directive states the requirement to the model');

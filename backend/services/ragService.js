@@ -287,7 +287,18 @@ const continuationBudget = (req, check, cap) => {
  *   requestId: unique per user message; used only for safe diagnostics/dedup.
  */
 
-const askCareerAssistant = async ({ userId, question, history = [], extraDocuments = null, attachedImages = [], userName = '', requestId = '', preferences = {} }) => {
+const askCareerAssistant = async ({
+  userId,
+  question,
+  history = [],
+  extraDocuments = null,
+  attachedImages = [],
+  userName = '',
+  requestId = '',
+  preferences = {},
+  onDelta,
+  abortSignal,
+}) => {
   // ---- Requirement analysis FIRST (pure text, no I/O) -----------------------
   // Everything downstream depends on it: whether retrieval is even relevant, how
   // big the output budget is, what the directive says, and whether the finished
@@ -582,6 +593,7 @@ ${buildDirective(req)}`;
   const temperature = ['GENERAL', 'EMOTIONAL_SUPPORT'].includes(intent) ? 0.6 : ['CODING', 'DSA', 'LEETCODE', 'LEARNING'].includes(intent) ? 0.6 : 0.4;
   let raw;
   let providerTruncated = false;
+  let providerCancelled = false;
   let providerFinishReason = '';
   // The provider that actually answered (primary or fallback). Continuation
   // turns are pinned to it ("same provider first where appropriate"): a long
@@ -589,7 +601,7 @@ ${buildDirective(req)}`;
   let activeProvider = '';
   let activeModel = '';
   try {
-    if (useBrowserSearch) {
+    if (useBrowserSearch && typeof onDelta !== 'function') {
       const r = await llmService.chatWithBrowserSearch({
         messages,
         temperature,
@@ -598,6 +610,7 @@ ${buildDirective(req)}`;
       });
       raw = r.content;
       providerTruncated = Boolean(r.truncated);
+      providerCancelled = Boolean(r.cancelled);
       providerFinishReason = String(r.finishReason || '');
       if (r.toolUsed && r.urls.length) browserUrls = r.urls;
       if (r.provider) activeProvider = r.provider;
@@ -610,11 +623,14 @@ ${buildDirective(req)}`;
         temperature,
         maxTokens: pickMaxTokens(intent, req, prefs),
         requestId,
+        onDelta,
+        abortSignal,
         returnMeta: true,
         ...(visionOn ? { model: VISION_MODEL, noFallback: true } : {}),
       });
       raw = r.content;
       providerTruncated = Boolean(r.truncated);
+      providerCancelled = Boolean(r.cancelled);
       providerFinishReason = String(r.finishReason || '');
       if (r.provider) activeProvider = r.provider;
       if (r.model) activeModel = r.model;
@@ -651,7 +667,7 @@ ${buildDirective(req)}`;
   // bounded (LLM_MAX_CONTINUATIONS, hard cap 6) and every merge is
   // de-duplicated, so nothing is repeated and nothing loops forever.
   let completionState = { continuationAttempts: 0 };
-  if (MAX_CONTINUATIONS > 0 && plan.needsContinuation) {
+  if (!providerCancelled && MAX_CONTINUATIONS > 0 && plan.needsContinuation) {
     let guard = 0;
     let continuationAttempts = 0;
     let continuationFailure = '';
@@ -684,6 +700,8 @@ ${buildDirective(req)}`;
           temperature,
           maxTokens: contBudget,
           requestId,
+          onDelta,
+          abortSignal,
           returnMeta: true,
           // Continue on the SAME provider that produced the partial answer — the
           // primary is not re-probed if the fallback rescued the first pass.
@@ -691,6 +709,7 @@ ${buildDirective(req)}`;
         });
         extra = String(r.content || '');
         providerTruncated = Boolean(r.truncated);
+        providerCancelled = Boolean(r.cancelled);
         providerFinishReason = String(r.finishReason || '');
       } catch (err) {
         // A continuation failure must NEVER destroy an answer we already have.
@@ -736,16 +755,19 @@ ${buildDirective(req)}`;
   }
 
   const finalCheck = checkCompleteness(answer, req);
-  const completion = plan.needsContinuation
+  const completion = (plan.needsContinuation || providerCancelled)
     ? {
-        complete: finalCheck.complete && !providerTruncated,
+        complete: finalCheck.complete && !providerTruncated && !providerCancelled,
         kind: finalCheck.kind,
         requested: req.itemCount || req.wordCount || null,
         produced: finalCheck.produced,
         nextIndex: finalCheck.nextIndex,
         target: finalCheck.target,
+        ...(finalCheck.duplicates?.length ? { duplicates: finalCheck.duplicates } : {}),
+        ...(finalCheck.missing?.length ? { missing: finalCheck.missing } : {}),
         finishReason: providerFinishReason,
         providerTruncated,
+        ...(providerCancelled ? { stopped: 'cancelled' } : {}),
         continuationAttempts: completionState.continuationAttempts,
         ...(completionState.continuationFailure ? { failure: completionState.continuationFailure } : {}),
         ...(completionState.continuationStopped ? { stopped: completionState.continuationStopped } : {}),

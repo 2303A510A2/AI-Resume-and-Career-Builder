@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Send, Trash2, Plus, MessageSquare, Loader2, Sparkles, UploadCloud, Briefcase, Paperclip, X, Mic, Square, Search, ChevronDown, Menu } from 'lucide-react';
-import { sendChatMessage, listChats, getChat, deleteChat, regenerateMessage, newRequestId, looksLikeImageRequest, searchChats } from '../services/chatService';
+import { streamChatMessage, sendChatMessage, listChats, getChat, deleteChat, regenerateMessage, newRequestId, looksLikeImageRequest, searchChats } from '../services/chatService';
 import { getAuthToken, inspectToken, clearToken } from '../services/authService';
 import { uploadChatFiles, classifyFileName, ACCEPTED_FILE_TYPES } from '../services/fileService';
 import { getResume, getJob } from '../services/resumeService';
@@ -360,6 +360,7 @@ export default function CareerAssistant() {
   const recordingRef = useRef(false);
   // Stale-response guard: only the LATEST requestId may update the UI.
   const latestRequestIdRef = useRef(null);
+  const streamAbortRef = useRef(null);
 
   // Loads one page of conversations (newest first). `append=true` adds the next
   // page to what the sidebar already shows — no duplicates, no re-downloading.
@@ -738,6 +739,8 @@ export default function CareerAssistant() {
     sendingRef.current = true;
     setSending(true);
     const rid = newRequestId();
+    const streamAbort = new AbortController();
+    streamAbortRef.current = streamAbort;
     latestRequestIdRef.current = rid;
     const docIds = pendingDocs.map((d) => d.id);
     try {
@@ -748,24 +751,53 @@ export default function CareerAssistant() {
       // 404 cannot loop. Reusing `rid` is safe: requestDedup never caches a
       // failed job, so the retry is a genuine new run, not a replayed duplicate.
       let data;
+      const appendLive = (text) => {
+        if (!text || latestRequestIdRef.current !== rid) return;
+        setMessages((current) => {
+          const out = [...current];
+          const index = out.findIndex((m) => m.role === 'assistant' && m.streamingRequestId === rid);
+          if (index < 0) out.push({ role: 'assistant', content: text, streamingRequestId: rid });
+          else out[index] = { ...out[index], content: `${out[index].content || ''}${text}` };
+          return out;
+        });
+      };
+      const replaceLive = (text) => {
+        if (latestRequestIdRef.current !== rid) return;
+        setMessages((current) => current.map((m) =>
+          m.role === 'assistant' && m.streamingRequestId === rid
+            ? { ...m, content: text }
+            : m
+        ));
+      };
+      setMessages((current) => [...current, { role: 'assistant', content: '', streamingRequestId: rid }]);
       try {
-        ({ data } = await sendChatMessage(question, activeChatId, docIds, rid));
+        data = await streamChatMessage(question, activeChatId, docIds, rid, {
+          signal: streamAbort.signal,
+          onDelta: appendLive,
+          onReplace: replaceLive,
+        });
       } catch (err) {
         if (err.response?.status !== 404 || !activeChatId) throw err;
         setActiveChatId(null);
-        ({ data } = await sendChatMessage(question, null, docIds, rid));
+        data = await streamChatMessage(question, null, docIds, rid, {
+          signal: streamAbort.signal,
+          onDelta: appendLive,
+          onReplace: replaceLive,
+        });
       }
       if (latestRequestIdRef.current !== rid) return; // a newer message superseded this one
-      setMessages((m) => [...m, {
-        role: 'assistant',
-        content: data.message?.content || '',
-        resources: data.resources || [],
-        sources: data.sources || [],
-        completion: data.completion || data.message?.completion || undefined,
-        // Present only when the backend really generated an image. The bytes are
-        // not here — ChatMessage fetches them with the JWT from /api/ai/images/:id.
-        image: data.message?.image || data.image || undefined,
-      }]);
+      setMessages((current) => current.map((m) =>
+        m.role === 'assistant' && m.streamingRequestId === rid
+          ? {
+              role: 'assistant',
+              content: data.message?.content || m.content || '',
+              resources: data.resources || [],
+              sources: data.sources || [],
+              completion: data.completion || data.message?.completion || undefined,
+              image: data.message?.image || data.image || undefined,
+            }
+          : m
+      ));
       if (!activeChatId) setActiveChatId(data.conversationId);
       if (docIds.length) setPendingDocs([]); // attached docs stay on the server
       if (chatPrefs.voicePlayback && data.message?.content) speakAnswer(data.message.content);
@@ -788,11 +820,16 @@ export default function CareerAssistant() {
         retryable: fb.retryable !== false,
       }]);
     } finally {
+      streamAbortRef.current = null;
       sendingRef.current = false;
       setSending(false);
       setTypingVariant('think');
       setShowSuggestions(false);
     }
+  };
+
+  const stopGeneration = () => {
+    if (streamAbortRef.current) streamAbortRef.current.abort();
   };
 
   const send = async (text) => {
@@ -1129,6 +1166,11 @@ export default function CareerAssistant() {
                               : 'AI is thinking…'}
                   </span>
                   <span className="typing-dot" /><span className="typing-dot" /><span className="typing-dot" />
+                  {sending && (
+                    <button type="button" className="btn btn-ghost chat-stop" onClick={stopGeneration}>
+                      <Square size={13} /> Stop generation
+                    </button>
+                  )}
                 </div>
               </div>
             )}

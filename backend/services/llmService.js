@@ -496,7 +496,68 @@ const aiErrorLog = ({ requestId = '', provider = '', model = '', status = '', ht
  * - backoff honors Retry-After / x-ratelimit-reset-tokens, capped at
  *   MAX_BACKOFF_MS; total retries are hard-capped (retries param).
  */
-const attemptWithProvider = async (cfg, { messages, temperature, maxTokens, retries, tools, toolChoice, requestId }) => {
+const consumeStreamingResponse = async (resp, { onDelta, abortSignal, cfg, attemptCount, startedAt, retryAfterMs, rateLimit }) => {
+  const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+  if (!reader) throw apiError('The AI provider returned an unreadable streaming response.', 502, 'AI_EMPTY_RESPONSE');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let finishReason = '';
+  const consume = async (line) => {
+    const raw = line.trim();
+    if (!raw || raw.startsWith(':') || raw === 'data: [DONE]' || !raw.startsWith('data:')) return;
+    let event;
+    try { event = JSON.parse(raw.slice(5).trim()); } catch { return; }
+    const choice = event?.choices?.[0];
+    const delta = choice?.delta?.content;
+    if (typeof delta === 'string' && delta) {
+      content += delta;
+      await onDelta(delta);
+    }
+    if (choice?.finish_reason) finishReason = String(choice.finish_reason);
+  };
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      buffer += decoder.decode(part.value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) await consume(line);
+    }
+    if (buffer.trim()) await consume(buffer);
+    if (abortSignal?.aborted) finishReason = 'cancelled';
+  } catch (err) {
+    if (!content) throw err;
+    finishReason = abortSignal?.aborted ? 'cancelled' : 'stream_error';
+  }
+  return {
+    content: content ? content.trim() : null,
+    toolCalls: [],
+    provider: cfg.provider,
+    model: cfg.model,
+    attempts: attemptCount,
+    durationMs: Date.now() - startedAt,
+    retryAfterMs,
+    rateLimit,
+    finishReason,
+    truncated: finishReason === 'length' || finishReason === 'stream_error',
+    cancelled: finishReason === 'cancelled',
+    usage: { promptTokens: null, completionTokens: null },
+  };
+};
+
+const attemptWithProvider = async (cfg, {
+  messages,
+  temperature,
+  maxTokens,
+  retries,
+  tools,
+  toolChoice,
+  requestId,
+  onDelta,
+  abortSignal,
+}) => {
   const startedAt = Date.now();
   const reqTag = requestId ? `requestId=${requestId} ` : '';
   const total = retries + 1;
@@ -524,6 +585,11 @@ const attemptWithProvider = async (cfg, { messages, temperature, maxTokens, retr
     if (Date.now() >= deadlineAt) break;
 
     const controller = new AbortController();
+    const abortUpstream = () => controller.abort();
+    if (abortSignal) {
+      if (abortSignal.aborted) controller.abort();
+      else abortSignal.addEventListener('abort', abortUpstream, { once: true });
+    }
     const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
     let retryable = false;
 
@@ -532,6 +598,7 @@ const attemptWithProvider = async (cfg, { messages, temperature, maxTokens, retr
       messages,
       temperature,
       max_tokens: tokenBudget,
+      ...(typeof onDelta === 'function' ? { stream: true } : {}),
     };
     if (Array.isArray(tools) && tools.length) {
       body.tools = tools;
@@ -642,6 +709,18 @@ const attemptWithProvider = async (cfg, { messages, temperature, maxTokens, retr
             }
           }
         } else {
+          if (typeof onDelta === 'function') {
+            const streamed = await consumeStreamingResponse(resp, {
+              onDelta,
+              abortSignal,
+              cfg,
+              attemptCount,
+              startedAt,
+              retryAfterMs,
+              rateLimit,
+            });
+            return { ok: true, value: streamed };
+          }
           const data = await resp.json().catch(() => null);
           const msg = data?.choices?.[0]?.message || null;
           const content = msg?.content;
@@ -702,6 +781,7 @@ const attemptWithProvider = async (cfg, { messages, temperature, maxTokens, retr
       }
     } finally {
       clearTimeout(timer);
+      if (abortSignal) abortSignal.removeEventListener('abort', abortUpstream);
     }
 
     if (!retryable) break;
@@ -827,6 +907,8 @@ const requestCompletion = async ({
   noFallback = false,
   preferProvider = '',
   preferModel = '',
+  onDelta,
+  abortSignal,
 }) => {
   if (!isConfigured()) throw notConfiguredError();
 
@@ -863,6 +945,8 @@ const requestCompletion = async ({
     tools,
     toolChoice,
     requestId,
+    onDelta,
+    abortSignal,
   });
   if (first.ok) {
     aiLog({ requestId, provider: cfg.provider, model: cfg.model, status: 200, durationMs: first.value.durationMs, attempts: first.value.attempts, category: first.value.truncated ? 'OK(truncated)' : 'OK' });
@@ -891,6 +975,8 @@ const requestCompletion = async ({
         tools,
         toolChoice,
         requestId,
+        onDelta,
+        abortSignal,
       });
       if (attempt.ok) {
         aiLog({ requestId, provider: fb.provider, model: fb.model, status: 200, durationMs: attempt.value.durationMs, attempts: attempt.value.attempts, category: 'OK' });
@@ -986,8 +1072,33 @@ const requestCompletion = async ({
  *          maxRetries?:number, requestId?:string, returnMeta?:boolean}} opts
  * @returns {Promise<string|{content:string, finishReason:string, truncated:boolean, usage:Object}>}
  */
-const chat = async ({ messages, temperature = 0.5, maxTokens = 1200, maxRetries, requestId = '', model = '', noFallback = false, preferProvider = '', preferModel = '', returnMeta = false }) => {
-  const r = await requestCompletion({ messages, temperature, maxTokens, maxRetries, requestId, model, noFallback, preferProvider, preferModel });
+const chat = async ({
+  messages,
+  temperature = 0.5,
+  maxTokens = 1200,
+  maxRetries,
+  requestId = '',
+  model = '',
+  noFallback = false,
+  preferProvider = '',
+  preferModel = '',
+  returnMeta = false,
+  onDelta,
+  abortSignal,
+}) => {
+  const r = await requestCompletion({
+    messages,
+    temperature,
+    maxTokens,
+    maxRetries,
+    requestId,
+    model,
+    noFallback,
+    preferProvider,
+    preferModel,
+    onDelta,
+    abortSignal,
+  });
   if (!r.content) {
     throw apiError(
       'The AI model requested a search tool that is not enabled, and returned an empty response. Please try again in a moment.',
@@ -997,7 +1108,15 @@ const chat = async ({ messages, temperature = 0.5, maxTokens = 1200, maxRetries,
     );
   }
   if (returnMeta) {
-    return { content: r.content, finishReason: r.finishReason || '', truncated: Boolean(r.truncated), usage: r.usage || {}, provider: r.provider || '', model: r.model || '' };
+    return {
+      content: r.content,
+      finishReason: r.finishReason || '',
+      truncated: Boolean(r.truncated),
+      cancelled: Boolean(r.cancelled),
+      usage: r.usage || {},
+      provider: r.provider || '',
+      model: r.model || '',
+    };
   }
   return r.content;
 };

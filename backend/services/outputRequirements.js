@@ -315,6 +315,30 @@ const numberedRuns = (text) => {
   return nums;
 };
 
+/**
+ * Returns the numeric progress of a numbered response without losing gaps or
+ * duplicate markers. The Set returned by numberedRuns is intentionally
+ * forgiving for ordinary completeness checks; continuation decisions need the
+ * additional information so a repeated item cannot be mistaken for progress.
+ */
+const numberedProgress = (text) => {
+  const nums = [];
+  const t = String(text || '');
+  const marker =
+    /^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*(\d{1,4})[ \t]*(?:[.)]\**|:\**)[ \t]+/gm;
+  let m;
+  while ((m = marker.exec(t)) !== null) nums.push(Number(m[1]));
+  const unique = [...new Set(nums)].sort((a, b) => a - b);
+  const duplicates = [...new Set(nums.filter((n, i) => nums.indexOf(n) !== i))].sort((a, b) => a - b);
+  const missing = [];
+  if (unique.length > 1) {
+    for (let n = unique[0]; n <= unique[unique.length - 1]; n += 1) {
+      if (!unique.includes(n)) missing.push(n);
+    }
+  }
+  return { numbers: unique, duplicates, missing };
+};
+
 /** Non-empty bullet/dash lines — used when a list is not numbered. */
 const bulletCount = (text) => {
   const t = String(text || '');
@@ -713,6 +737,7 @@ const checkCompleteness = (text, req = {}) => {
     const from = req.continueFrom && req.continueFrom > 1 ? req.continueFrom : 1;
     const to = req.targetTotal ? req.targetTotal : from + req.itemCount - 1;
     const nums = numberedRuns(body);
+    const progress = numberedProgress(body);
     let produced = 0;
     let missingFrom = null;
     for (let i = from; i <= to; i += 1) {
@@ -744,16 +769,25 @@ const checkCompleteness = (text, req = {}) => {
     // per table but no digits) falls back to counting list lines.
     const useBullets = produced === 0 && body.length > 40;
     const effective = useBullets ? bulletCount(body) : produced;
-    if (effective < req.itemCount) {
+    if (effective < req.itemCount || progress.duplicates.length || progress.missing.length) {
+      const next = missingFrom !== null
+        ? missingFrom
+        : (progress.missing[0] || null);
       return {
         complete: false,
-        nextIndex: missingFrom !== null ? missingFrom : from + effective,
+        nextIndex: next || (progress.duplicates.length ? null : from + effective),
         produced: effective,
         words,
         target: to,
-        reason: useBullets
+        duplicates: progress.duplicates,
+        missing: progress.missing,
+        reason: progress.duplicates.length
+          ? `duplicate item marker(s): ${progress.duplicates.join(', ')}`
+          : useBullets
           ? `${effective}/${req.itemCount} items found`
-          : `items ${from}..${(missingFrom !== null ? missingFrom - 1 : to)} of ${from}..${to} present`,
+          : progress.missing.length
+            ? `missing item marker(s): ${progress.missing.join(', ')}`
+            : `items ${from}..${(missingFrom !== null ? missingFrom - 1 : to)} of ${from}..${to} present`,
         kind: useBullets ? 'bullets' : 'items',
       };
     }
@@ -780,7 +814,17 @@ const checkCompleteness = (text, req = {}) => {
         }
       }
     }
-    return { complete: true, nextIndex: null, produced: effective, words, target: to, reason: `items ${from}..${to} all present`, kind: 'items' };
+    return {
+      complete: true,
+      nextIndex: null,
+      produced: effective,
+      words,
+      target: to,
+      duplicates: progress.duplicates,
+      missing: progress.missing,
+      reason: `items ${from}..${to} all present`,
+      kind: 'items',
+    };
   }
 
   return { complete: true, nextIndex: null, produced: 0, words, target: null, reason: 'no finite quantity requested', kind: 'none' };
@@ -818,9 +862,15 @@ const buildContinuationPrompt = ({ req = {}, check = {}, producedText = '', ques
       'Rules for this continuation: start immediately with the next item; use the SAME numbering and the SAME format as before; do NOT restart at 1; do NOT repeat, re-list, or summarise earlier items; do NOT write any introduction, conclusion, "let me know" or follow-up question; never use "..." or "and so on" in place of the missing items.'
     );
   } else {
-    lines.push(
+    if (check.duplicates && check.duplicates.length) {
+      lines.push(
+        `Your previous reply repeated item marker(s) ${check.duplicates.join(', ')}. Continue by supplying only the missing or corrected item content; do NOT repeat any item already present and do NOT restart at 1.`
+      );
+    } else {
+      lines.push(
       'Your previous reply was cut off before it was complete. Continue it from exactly where it stopped, adding only new content. Do not restart, repeat, or summarise what you already wrote, and do not add a preamble or a closing question.'
-    );
+      );
+    }
   }
 
   return lines.join('\n');
@@ -843,10 +893,11 @@ const mergeContinuation = (existing, extra) => {
   if (!add) return head;
 
   // ---- 1. number-aware cut ----
-  const ITEM_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?(\d{1,4})[.)][ \t]+\S/;
+  const ITEM_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*(\d{1,4})[.)][ \t]*\**[ \t]+\S/;
+  const COLON_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*(\d{1,4})[ \t]*:\**[ \t]+\S/;
   const HEADING_LINE_RE = /^[ \t#*]*(?:table|step|question|problem|example|no\.?)[ \t]+(\d{1,4})\b/i;
   const itemNumber = (line) => {
-    const m = ITEM_LINE_RE.exec(line) || HEADING_LINE_RE.exec(line);
+    const m = ITEM_LINE_RE.exec(line) || COLON_LINE_RE.exec(line) || HEADING_LINE_RE.exec(line);
     return m ? Number(m[1]) : null;
   };
 
@@ -918,8 +969,8 @@ const mergeContinuation = (existing, extra) => {
   const lastMarker = km(lastLine);
   const seamContent = add.split('\n').every((l, idx) => {
     if (!l.trim()) return true;
-    if (itemNumber(l) !== null) return false; // a new numbered item -> paragraph
     if (idx === 0 && lastMarker !== null && km(l) === lastMarker) return true; // re-emits the SAME row
+    if (itemNumber(l) !== null) return false; // a new numbered item -> paragraph
     if (/^[ \t]*\**#*\s*\d{1,4}\s*:\s*\S/.test(l)) return false; // a NEW colon row -> paragraph
     return true;
   });
@@ -946,6 +997,7 @@ module.exports = {
   estimateTokens,
   wordCount,
   numberedRuns,
+  numberedProgress,
   bulletCount,
   ordinal,
   UNITS,

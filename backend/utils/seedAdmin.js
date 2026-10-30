@@ -1,4 +1,5 @@
 const User = require('../models/User');
+const { emailLookup } = require('./validators');
 
 const VALID_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
@@ -55,22 +56,14 @@ const bootstrapMainAdmin = async () => {
     return { created: false, existing: true };
   }
 
-  // No Main Admin Leader yet. If the env email already belongs to an ordinary
-  // account, promote it ONCE (server-side env only) and reset its password to the
-  // configured initial password, forcing a change at first login.
-  const existingUser = await User.findOne({ email });
+  // Do not silently promote or reset an existing ordinary account. Bootstrap is
+  // intentionally create-only: an operator who wants to recover an existing
+  // account must perform an explicit, audited database/admin operation.
+  const existingUser = await User.findOne(emailLookup(email));
   if (existingUser) {
-    existingUser.role = 'main_admin';
-    existingUser.mustChangePassword = true;
-    existingUser.password = password; // hashed by the pre-save hook
-    existingUser.isActive = true;
-    existingUser.adminPermissions = { ...FULL_PERMISSIONS };
-    existingUser.suspendedAt = null;
-    existingUser.suspendReason = '';
-    await existingUser.save();
-    console.log(`👑 Main Admin Leader bootstrapped from an existing account: ${email}`);
-    console.log('   The initial password is set and MUST be changed at first login.');
-    return { created: true, promoted: true };
+    console.warn(`⚠️  Main Admin Leader bootstrap skipped — an ordinary account already uses ${email}.`);
+    console.warn('   No role, password, or account state was changed. Use an explicit operator recovery process.');
+    return { created: false, existingUser: true, reason: 'email-in-use' };
   }
 
   await User.create({

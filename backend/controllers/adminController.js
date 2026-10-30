@@ -10,7 +10,7 @@ const RAGDocument = require('../models/RAGDocument');
 const GeneratedImage = require('../models/GeneratedImage');
 const Document = require('../models/Document');
 const OTP = require('../models/OTP');
-const { sanitizeUser, isValidEmail, isValidPassword } = require('../utils/validators');
+const { sanitizeUser, isValidEmail, isValidPassword, emailLookup } = require('../utils/validators');
 const { generateToken } = require('../utils/generateToken');
 const { dbState } = require('../config/db');
 const llmService = require('../services/llmService');
@@ -25,13 +25,11 @@ const notificationService = require('../services/notificationService');
 
 const ADMIN_ROLES = ['co_admin', 'main_admin'];
 const isAdminRole = (r) => ADMIN_ROLES.includes(r);
-const PROTECTED_MAIN_ADMIN_EMAIL = 'metebharath4@gmail.com';
 const isProtectedMainAdminAccount = (user) => {
   if (!user) return false;
   const email = String(user.email || '').trim().toLowerCase();
   const configuredEmail = String(process.env.INITIAL_ADMIN_EMAIL || '').trim().toLowerCase();
   return user.role === 'main_admin'
-    || email === PROTECTED_MAIN_ADMIN_EMAIL
     || Boolean(configuredEmail && email === configuredEmail);
 };
 
@@ -157,7 +155,7 @@ const login = async (req, res) => {
   if (!isValidEmail(email) || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
-  const user = await User.findOne({ email: String(email).toLowerCase() }).select('+password');
+  const user = await User.findOne(emailLookup(email)).select('+password');
   if (!user || !(await user.matchPassword(password))) {
     return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' });
   }
@@ -194,7 +192,7 @@ const requestAccess = async (req, res) => {
   if (!isValidEmail(email) || !password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
-  const user = await User.findOne({ email: String(email).toLowerCase() }).select('+password');
+  const user = await User.findOne(emailLookup(email)).select('+password');
   if (!user || !(await user.matchPassword(password))) {
     return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.' });
   }
