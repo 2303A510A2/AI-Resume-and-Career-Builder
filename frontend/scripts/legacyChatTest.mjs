@@ -146,6 +146,8 @@ const sidebarPrelude = `
   function saveSession(s){ store[s.id] = s; }
   function createSession(title, ts){ var id=uid(); var s={id:id,serverId:null,title:title||"New Chat",created:ts||Date.now(),updated:ts||Date.now(),messages:[],hydrated:false,count:0}; store[id]=s; return s; }
   function toast(){}
+  function chatOwnerKey(){ return ""; }
+  function isChatWorkspaceCurrent(){ return true; }
   var _listHtml = "";
   var _box = { _c:{}, add:function(c){this._c[c]=1;}, remove:function(c){delete this._c[c];}, toggle:function(c,on){ if(on) this._c[c]=1; else delete this._c[c]; } };
   function $(id){
