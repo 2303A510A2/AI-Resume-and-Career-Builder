@@ -78,6 +78,15 @@ const MIN_OUTPUT_TOKENS = 64;
 const PROBE_TIMEOUT_MS = Number(process.env.LLM_PROBE_TIMEOUT_MS || 20000);
 const PROBE_CACHE_MS = Number(process.env.LLM_PROBE_CACHE_MS || 60000);
 
+const probeErrorCategory = (status) => {
+  if (status === 401) return 'authentication';
+  if (status === 403) return 'authorization';
+  if (status === 404) return 'endpoint_or_model';
+  if (status === 408 || status === 429) return 'rate_limited';
+  if (status >= 500) return 'provider_server_error';
+  return 'provider_http_error';
+};
+
 // 429 bodies that mean the DAILY (per-day) quota is exhausted, e.g. Groq's
 // "Rate limit reached for model ... on tokens per day (TPD): Limit 200000,
 // Used 200000 ... Please try again in 35.424s." Retrying these with long
@@ -1175,10 +1184,23 @@ let probeState = {
   modelAvailable: null, // null (unknown) | true | false
   availableModels: [],
 };
+let probePromise = null;
 
 const freshProbe = (s) => Boolean(s.status) && Date.now() - s.at < PROBE_CACHE_MS;
 
 async function doProbe() {
+  const configIssue = providers.configurationIssue(getConfig());
+  if (configIssue) {
+    probeState = {
+      status: 'misconfigured',
+      at: Date.now(),
+      detail: configIssue,
+      inFlight: false,
+      modelAvailable: null,
+      availableModels: [],
+    };
+    return probeState;
+  }
   if (!isConfigured()) {
     probeState = {
       status: 'not-configured',
@@ -1190,60 +1212,86 @@ async function doProbe() {
     };
     return probeState;
   }
-  if (probeState.inFlight) return probeState;
+  if (probePromise) return probePromise;
 
   const c = getConfig();
   probeState = { ...probeState, status: 'checking', inFlight: true };
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  probePromise = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+    const headers = { 'Content-Type': 'application/json' };
+    if (c.apiKey) headers.Authorization = `Bearer ${c.apiKey}`;
 
-  const headers = { 'Content-Type': 'application/json' };
-  if (c.apiKey) headers.Authorization = `Bearer ${c.apiKey}`;
-
-  let next;
-  try {
-    const resp = await fetch(`${c.baseUrl}/models`, { method: 'GET', headers, signal: controller.signal });
-    if (resp.ok) {
-      let ids = [];
-      let modelAvailable = null;
-      try {
-        const data = await resp.json();
-        ids = (data.data || []).map((m) => m && m.id).filter(Boolean);
-        modelAvailable = ids.includes(c.model);
-      } catch { /* list body ignored */ }
-      next = {
-        status: 'configured',
-        at: Date.now(),
-        detail: `reachable (${ids.length || 0} models listed)`,
-        inFlight: false,
-        modelAvailable,
-        availableModels: ids,
-      };
-    } else {
+    let next;
+    try {
+      const resp = await fetch(`${c.baseUrl}/models`, { method: 'GET', headers, signal: controller.signal });
+      if (resp.ok) {
+        let ids = [];
+        let modelAvailable = null;
+        try {
+          const data = await resp.json();
+          ids = (data.data || []).map((m) => m && m.id).filter(Boolean);
+          modelAvailable = ids.includes(c.model);
+        } catch { /* list body ignored */ }
+        next = {
+          status: 'configured',
+          at: Date.now(),
+          detail: `reachable (${ids.length || 0} models listed)`,
+          httpStatus: resp.status,
+          errorCategory: null,
+          inFlight: false,
+          modelAvailable,
+          availableModels: ids,
+        };
+      } else {
+        next = {
+          status: 'unreachable',
+          at: Date.now(),
+          detail: `GET /models returned HTTP ${resp.status}`,
+          httpStatus: resp.status,
+          errorCategory: probeErrorCategory(resp.status),
+          inFlight: false,
+          modelAvailable: null,
+          availableModels: [],
+        };
+      }
+    } catch (err) {
       next = {
         status: 'unreachable',
         at: Date.now(),
-        detail: `GET /models returned HTTP ${resp.status}`,
+        detail: err.name === 'AbortError' ? 'connection timed out' : 'provider probe failed',
+        httpStatus: null,
+        errorCategory: err.name === 'AbortError' ? 'timeout' : 'network',
         inFlight: false,
         modelAvailable: null,
         availableModels: [],
       };
+    } finally {
+      clearTimeout(timer);
     }
-  } catch (err) {
-    next = {
-      status: 'unreachable',
-      at: Date.now(),
-      detail: err.name === 'AbortError' ? 'connection timed out' : err.message,
-      inFlight: false,
-      modelAvailable: null,
-      availableModels: [],
-    };
+    probeState = next;
+    console.info(
+      `[AI HEALTH] provider=${c.provider} model=${c.model}` +
+      ` status=${next.status} httpStatus=${next.httpStatus || '-'} category=${next.errorCategory || '-'}`
+    );
+    return next;
+  })();
+
+  try {
+    return await probePromise;
   } finally {
-    clearTimeout(timer);
+    probePromise = null;
   }
-  probeState = next;
-  return next;
 }
+
+const probeStatus = async () => {
+  const c = getConfig();
+  const configIssue = providers.configurationIssue(c);
+  if (configIssue || !isConfigured()) return providerStatus();
+  if (freshProbe(probeState)) return providerStatus();
+  await doProbe();
+  return providerStatus();
+};
 
 /**
  * Current provider status for /api/health, never blocking on the network:
@@ -1252,6 +1300,20 @@ async function doProbe() {
  */
 const providerStatus = () => {
   const c = getConfig();
+  const configIssue = providers.configurationIssue(c);
+  if (configIssue) {
+    return {
+      status: 'misconfigured',
+      provider: c.provider,
+      model: c.model,
+      baseUrl: c.baseUrl,
+      detail: configIssue,
+      httpStatus: null,
+      errorCategory: 'configuration',
+      modelAvailable: null,
+      availableModels: [],
+    };
+  }
   if (!isConfigured()) {
     return {
       status: 'not-configured',
@@ -1259,6 +1321,8 @@ const providerStatus = () => {
       model: c.model,
       baseUrl: c.baseUrl,
       detail: 'Set LLM_API_KEY, AI_API_KEY, or GROQ_API_KEY in backend/.env. No key is present, so AI chat returns an honest 503 — answers are never simulated.',
+      httpStatus: null,
+      errorCategory: 'not_configured',
       modelAvailable: null,
       availableModels: [],
     };
@@ -1270,6 +1334,8 @@ const providerStatus = () => {
       model: c.model,
       baseUrl: c.baseUrl,
       detail: probeState.detail || '',
+      httpStatus: probeState.httpStatus || null,
+      errorCategory: probeState.errorCategory || null,
       modelAvailable: probeState.modelAvailable,
       availableModels: probeState.availableModels || [],
     };
@@ -1285,6 +1351,8 @@ const providerStatus = () => {
     model: c.model,
     baseUrl: c.baseUrl,
     detail: probeState.detail || '',
+    httpStatus: probeState.httpStatus || null,
+    errorCategory: probeState.errorCategory || null,
     modelAvailable: probeState.modelAvailable,
     availableModels: probeState.availableModels || [],
   };
@@ -1318,6 +1386,8 @@ module.exports = {
   getFallbackConfig,
   getFallbackChain,
   providerStatus,
+  probeStatus,
+  probeErrorCategory,
   doProbe,
   describe,
   // Budget/timeout introspection (used by the deterministic budget tests).

@@ -53,6 +53,8 @@ const resolveApiKey = (...candidates) => {
   return '';
 };
 
+const isGroqApiKey = (key) => /^gsk_/i.test(String(key || '').trim());
+
 const defaultModelFor = (provider) =>
   provider === 'groq' ? GROQ_DEFAULT_MODEL : OPENAI_DEFAULT_MODEL;
 
@@ -61,7 +63,6 @@ const defaultBaseFor = (provider) =>
 
 /** Builds the PRIMARY provider config (backwards-compatible with llmService.getConfig). */
 const primary = () => {
-  const configuredProvider = String(process.env.LLM_PROVIDER || process.env.AI_PROVIDER || '').trim().toLowerCase();
   const apiKey = resolveApiKey(
     process.env.LLM_API_KEY,
     process.env.AI_API_KEY,
@@ -69,6 +70,11 @@ const primary = () => {
     process.env.OPENAI_API_KEY
   );
   let baseUrl = normalizeBase(process.env.LLM_BASE_URL || process.env.AI_BASE_URL);
+  let configuredProvider = String(process.env.LLM_PROVIDER || process.env.AI_PROVIDER || '').trim().toLowerCase();
+  // A Groq key is unambiguous when no provider or endpoint was configured.
+  // This prevents the historical failure mode where LLM_API_KEY contained a
+  // Groq key but the absent provider settings silently selected OpenAI.
+  if (!configuredProvider && !baseUrl && isGroqApiKey(apiKey)) configuredProvider = 'groq';
   const provider = resolveProviderId({ configured: configuredProvider, baseUrl, hasKey: Boolean(apiKey) });
   if (!baseUrl) baseUrl = defaultBaseFor(provider);
 
@@ -76,6 +82,18 @@ const primary = () => {
   if (!model) model = defaultModelFor(provider);
 
   return { provider, baseUrl, model, apiKey };
+};
+
+const configurationIssue = (cfg = primary()) => {
+  const provider = String(cfg.provider || '').toLowerCase();
+  const baseUrl = String(cfg.baseUrl || '').toLowerCase();
+  if (provider === 'groq' && !/groq\.com/.test(baseUrl)) {
+    return 'LLM_PROVIDER=groq requires LLM_BASE_URL=https://api.groq.com/openai/v1.';
+  }
+  if (isGroqApiKey(cfg.apiKey) && provider !== 'groq') {
+    return 'A Groq API key requires LLM_PROVIDER=groq and the Groq OpenAI-compatible LLM_BASE_URL.';
+  }
+  return '';
 };
 
 /**
@@ -209,6 +227,7 @@ const describe = () => {
 
 module.exports = {
   primary,
+  configurationIssue,
   fallback,
   fallback2,
   allFallbacks,

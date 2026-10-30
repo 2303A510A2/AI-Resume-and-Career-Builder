@@ -175,10 +175,16 @@ app.use((req, res, next) => (isHealthProbe(req) ? next() : globalLimiter(req, re
 app.use(maintenanceMode);
 
 // ---- Health ----
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   const db = dbState();
   const mongodbConnected = db.connected;
-  const ai = llmService.providerStatus();
+  let ai;
+  try {
+    ai = await llmService.probeStatus();
+  } catch (err) {
+    console.error(`[AI HEALTH] provider probe failed category=internal status=-`);
+    ai = llmService.providerStatus();
+  }
   const payload = {
     success: mongodbConnected,
     status: 'ok',
@@ -186,10 +192,20 @@ app.get('/api/health', (req, res) => {
     mongodb: mongodbConnected ? 'connected' : 'disconnected',
     // AI provider state (never the API key): configured | unreachable | checking | not-configured
     aiProvider: ai.status,
+    aiProviderName: ai.provider,
+    aiProviderBaseUrl: ai.baseUrl,
+    aiProviderDetail: ai.detail,
+    aiProviderHttpStatus: ai.httpStatus,
+    aiProviderErrorCategory: ai.errorCategory,
     message: 'AI Resume Career Builder API is running',
     services: {
       database: mongodbConnected ? 'connected' : 'disconnected',
       llm: ai.status,
+      provider: ai.provider,
+      providerBaseUrl: ai.baseUrl,
+      providerDetail: ai.detail,
+      providerHttpStatus: ai.httpStatus,
+      providerErrorCategory: ai.errorCategory,
       model: ai.model,
       aiModelAvailable: ai.modelAvailable,
       embeddings: embeddingService.isConfigured() ? 'configured' : 'not-configured',
@@ -346,8 +362,9 @@ const start = async () => {
     console.log('⏳ Starting API without MongoDB — /api/health will report mongodb: disconnected until the database is reachable.');
   }
 
-  // Warm the provider reachability probe in the background so /api/health never
-  // blocks on a network call while still reporting configured / unreachable.
+  // Warm the provider reachability probe in the background. The health route
+  // also awaits the coalesced probe when its cache is stale, so it never leaves
+  // callers in an indefinite "checking" state.
   if (llmService.isConfigured()) {
     llmService.doProbe().catch(() => {});
   }
