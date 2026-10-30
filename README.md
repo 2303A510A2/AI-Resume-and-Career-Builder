@@ -122,7 +122,7 @@ npm run dev              # http://localhost:5000
 | `IMAGE_API_KEY` / `IMAGE_MODEL` / `IMAGE_BASE_URL` | Provider key / model / base URL. Only `openai` and `gemini` need a key; `pollinations` works anonymously |
 | `EMBEDDING_API_KEY` | Optional. Enables Atlas Vector Search retrieval |
 | `EMAIL_USER` / `EMAIL_PASSWORD` | Optional SMTP. Unset → OTPs print to the backend console |
-| `INITIAL_ADMIN_NAME` / `INITIAL_ADMIN_EMAIL` / `INITIAL_ADMIN_PASSWORD` | Bootstraps the single **Main Admin Leader** on startup (bcrypt-hashed; never reset once the account exists; `mustChangePassword` on first login). The legacy `ADMIN_EMAIL` / `ADMIN_PASSWORD` separate `Admin` collection is no longer used by the admin routes |
+| `INITIAL_ADMIN_NAME` / `INITIAL_ADMIN_EMAIL` / `INITIAL_ADMIN_PASSWORD` | Owner-authoritative bootstrap of the single **Main Admin Leader**. On every backend start the account at `INITIAL_ADMIN_EMAIL` is created if missing or repaired in place (role, active status, approval, full permissions), its `_id` and data are preserved, and it is the only account allowed to hold the role. The password is bcrypt-hashed and only rewritten when `INITIAL_ADMIN_PASSWORD` no longer verifies, so restarts never churn the hash but the configured password always works after a deployment. Rotate it by changing the env var and restarting. No extra recovery flags are needed. The legacy `ADMIN_EMAIL` / `ADMIN_PASSWORD` separate `Admin` collection is no longer used by the admin routes |
 | `ADMIN_JWT_EXPIRES_IN` | Admin session lifetime (default `8h`); admin JWTs also carry a session version (`av`) so revoking access invalidates existing tokens |
 
 ### 2. Frontend
@@ -144,15 +144,47 @@ origin. The backend trusts exactly one Render reverse-proxy hop for
 
 The Main Admin Leader is bootstrapped only from backend environment variables:
 `INITIAL_ADMIN_EMAIL`, `INITIAL_ADMIN_PASSWORD`, and optionally
-`INITIAL_ADMIN_NAME`. If no Main Admin Leader exists, the backend creates one
-with the initial password marked for mandatory change. If the configured email
-already belongs to an ordinary user, bootstrap stops without changing that
-account's role, password, or status. An operator must choose a different
-bootstrap email or perform an explicit, audited recovery operation. If a Main
-Admin Leader already exists, bootstrap does nothing and never resets its
-password. The legacy `ADMIN_*` names remain supported as a
-local/backward-compatible fallback, but new Render deployments should use the
-`INITIAL_ADMIN_*` names explicitly. Never put these values in frontend code.
+`INITIAL_ADMIN_NAME`. Local development reads `backend/.env`; production reads
+the Render service environment — the two are independent, and neither value is
+ever committed. The contract on every start:
+
+- If no account exists at `INITIAL_ADMIN_EMAIL`, it is created with the
+  configured password **bcrypt-hashed by the `User` model** (`mustChangePassword`
+  is not forced, because the operator already controls this credential).
+- If the account exists (ordinary user or an older leader), it is **repaired in
+  place**: `role=main_admin`, `isActive=true`, suspension cleared, full admin
+  permissions, `adminApprovedAt` set. Its `_id`, profile, resumes and chats are
+  preserved — it is never recreated or deleted.
+- If **any other account** still holds `main_admin`, it is demoted to an ordinary
+  user (`role=user`, no permissions/approval, admin sessions revoked). Its record
+  and data are preserved. Only the configured owner email can ever hold the role,
+  so ordinary users are never promoted.
+- The configured password is **verified first and rewritten only when it does not
+  match**. A restart/redeploy therefore never churns the hash, while the password
+  configured in Render (or `backend/.env`) is guaranteed to work after every
+  deployment. To rotate the admin password, update `INITIAL_ADMIN_PASSWORD` in the
+  environment and restart/redeploy; changing it only in the UI will be overridden
+  by the next start by design.
+- Exactly one `main_admin` exists after every run. Failed connection at boot is
+  healed: the bootstrap runs once as soon as MongoDB becomes reachable, so a
+  slow Render cold start can no longer leave the deployment without a leader.
+
+The bootstrap writes no secrets to logs (emails/roles/repair names only). The
+legacy `ADMIN_*` names are still accepted as a fallback for the `INITIAL_ADMIN_*`
+values, but new Render deployments should use the `INITIAL_ADMIN_*` names
+explicitly. Never put these values in frontend code.
+
+To check the live account without printing any credential, run from `backend/`:
+
+```bash
+node scripts/adminBootstrapStatus.js          # read-only; exit 0 only when HEALTHY
+node scripts/adminBootstrapStatus.js --apply  # create/adopt/repair using the env
+```
+
+It reports the configured email, leader count, role, active/blocked state,
+approval, permission completeness, whether the stored value is a bcrypt hash, and
+whether the configured password verifies. It never prints a password or hash.
+On Render the same command works from the service **Shell** tab.
 
 In dev every application route (`/`, `/dashboard`, `/dashboard/career-assistant`,
 `/react-app.html`) serves the React SPA, so deep links work on a plain reload; the
@@ -672,10 +704,11 @@ node scripts/realAiTest.js         # REAL-provider verification (needs a working
    `FRONTEND_URL=https://<your-vercel-app>.vercel.app` (CORS accepts either —
    if BOTH are missing in production the backend logs a loud warning and denies
    every browser origin, which the browser surfaces as "Backend server is
-   offline"), plus optional `INITIAL_ADMIN_NAME`/`INITIAL_ADMIN_EMAIL`/
-   `INITIAL_ADMIN_PASSWORD` and
-   `EMAIL_HOST`/`EMAIL_PORT`. Do NOT set `PORT`: Render injects it (the backend
-   binds `process.env.PORT || 5000`).
+   offline"), plus `INITIAL_ADMIN_NAME` / `INITIAL_ADMIN_EMAIL` /
+   `INITIAL_ADMIN_PASSWORD` (the only three the bootstrap needs; the configured
+   account is created or repaired on every start and is the only `main_admin`)
+   and `EMAIL_HOST`/`EMAIL_PORT`. Do NOT set `PORT`: Render injects it (the
+   backend binds `process.env.PORT || 5000`).
 3. The server binds `0.0.0.0:<PORT>` on Render and stays running while the
    MongoDB retry loop attempts recovery. `GET /api/health` returns HTTP 200 only
    when MongoDB is connected and HTTP 503 with the real disconnected state
@@ -737,12 +770,19 @@ never the authority: hiding a button or forging a role in a request body/token
 can never grant access. Admin middleware always reads the effective role and
 session version from the database record, never from the JWT claims.
 
-- **Main Admin Leader (exactly one).** Bootstrapped from
+- **Main Admin Leader (exactly one, owner-authoritative).** Bootstrapped from
   `INITIAL_ADMIN_EMAIL` / `INITIAL_ADMIN_PASSWORD` (bcrypt-hashed, never returned
-  by any API, never reset once the account exists). It must change the password
-  on first sign-in (`mustChangePassword`, enforced by backend middleware, not just
-  the UI) and can never be deleted, suspended, or demoted by an ordinary user or a
-  co-admin.
+  by any API). On every start the configured owner account is created if missing
+  or repaired in place (role, active status, approval, full permissions) with its
+  `_id` and data preserved; it is the only account allowed to hold the role, so
+  any other `main_admin` is demoted to an ordinary user. The configured password
+  is verified first and rewritten only when it no longer matches, so restarts do
+  not churn the hash while the Render/`.env` password always works after a
+  deployment (rotate it through the environment). The env-managed owner is not
+  forced through a UI password change — that would be reverted by the next
+  deployment; co-admins approved through the UI still are. The leader can never be
+  deleted, suspended, or demoted by an ordinary user or a co-admin.
+  `node scripts/adminBootstrapStatus.js` reports the live state without secrets.
 - **Becoming an admin.** A normal user opens the admin portal at `/admin` (also
   reachable from *Settings → Account → Administrator access*) and submits a
   **request with a reason**. A request by itself grants **no** session and **no**
@@ -782,6 +822,8 @@ See the top of this document for the feature list. The executable suites are:
 | --- | --- | --- |
 | API end-to-end | `cd backend && node scripts/smokeTest.js` | 77 assertions over the whole REST surface, including the admin auth boundary + RBAC + cascade delete (needs the backend and MongoDB running) |
 | Admin RBAC (offline) | `cd backend && node scripts/adminRbacTest.js` | 23 checks of the server-side role/permission matrix, main-admin protection, and session-version revocation (no server, no DB, no key) |
+| Admin bootstrap (DB) | `cd backend && node scripts/adminBootstrapTest.js` | owner-authoritative Main Admin Leader provisioning: create, adopt an existing ordinary owner account with no flag, never promote a non-owner, repair role/active/approval/permissions, restore a drifted password from the env (verify-first, no churn), demote any previous/duplicate leader while keeping its record, exactly one leader, bcrypt-only storage, no secret logging (uses a throwaway test database) |
+| Admin bootstrap status (read-only) | `cd backend && node scripts/adminBootstrapStatus.js` | reports the configured owner's role, active/blocked state, approval, permission completeness, bcrypt storage and whether the configured password verifies — no password/hash ever printed; exits non-zero unless HEALTHY; `--apply` runs the idempotent repair |
 | Admin E2E (live) | `cd backend && node scripts/adminSystemTest.js` | 77 live checks: bootstrap, forced first-login change, request→approval, RBAC, co-admin revoke, suspend/restore/delete + cascade, real stats, settings/maintenance, audit, redaction (needs the backend + MongoDB; restores the Main Admin Leader) |
 | Admin UI (real browser) | `cd backend && node scripts/adminUiSmokeTest.js` | 15 checks driving headless Chrome over CDP through the SPA: login, forced-password gate, exactly two primary dashboard cards (Total Users / Total Conversations), all 5 admin sections, real user/audit rows, logout (needs the frontend dev server + backend; restores the Main Admin Leader) |
 | Output requirements | `cd backend && node scripts/outputRequirementsTest.js` | 116 deterministic checks: quantity/range/word-count/format detection, dynamic budget (incl. the real `pickMaxTokens`), list markers, completeness, non-duplicating merge (no server/key/DB) |

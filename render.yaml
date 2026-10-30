@@ -62,8 +62,10 @@ services:
         sync: false
       - key: ADMIN_NAME
         sync: false
-      # One-time Main Admin Leader bootstrap. The backend never reads these
-      # values from a request and never overwrites an existing main admin.
+      # Main Admin Leader bootstrap (owner-authoritative, idempotent). Read ONLY
+      # from this service environment; never from a request, never committed.
+      # The account at INITIAL_ADMIN_EMAIL is created or repaired in place on
+      # every start and is the only account allowed to hold main_admin.
       - key: INITIAL_ADMIN_NAME
         sync: false
       - key: INITIAL_ADMIN_EMAIL

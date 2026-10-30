@@ -12,6 +12,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const os = require('os');
+const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
 const { dbState } = connectDB;
@@ -352,14 +353,31 @@ const start = async () => {
   // real connection status, and config/db.js keeps retrying in the background.
   const db = await connectDB();
 
-  if (db.connected) {
+  // The Main Admin Leader bootstrap must run against a REAL connection. It is
+  // idempotent and owner-authoritative: it creates/repairs only the account at
+  // INITIAL_ADMIN_EMAIL, never creates a second leader, and only rewrites the
+  // password when the configured value no longer verifies. Previously it ran
+  // only when the very first connection attempt succeeded: a Render cold start
+  // that reached MongoDB a few seconds late left the deployment with NO Main
+  // Admin Leader at all (Admin Sign In then answered 401 forever, until the next
+  // manual redeploy).
+  const runAdminBootstrap = async () => {
+    if (!dbState().connected) return;
     try {
       await seedAdmin();
     } catch (err) {
       console.error('⚠️  Admin seed skipped:', err.message);
     }
+  };
+
+  if (db.connected) {
+    await runAdminBootstrap();
   } else {
     console.log('⏳ Starting API without MongoDB — /api/health will report mongodb: disconnected until the database is reachable.');
+    // Run the bootstrap once, as soon as the background retry loop succeeds.
+    mongoose.connection.once('connected', () => {
+      runAdminBootstrap();
+    });
   }
 
   // Warm the provider reachability probe in the background. The health route
