@@ -1054,6 +1054,8 @@ const requestCompletion = async ({
   }
 
   const err = first.error;
+  if (err && first.retryAfterMs) err.retryAfterMs = first.retryAfterMs;
+  if (err && first.rateLimit) err.rateLimit = first.rateLimit;
   aiLog({ requestId, provider: cfg.provider, model: cfg.model, status: err.statusCode || 502, attempts: first.attempts, category: aiCategoryFromCode(err.code) });
   if (err && typeof err.detail === 'string' && !err.detail.includes('gave up after')) {
     err.detail = `${err.detail} ${reqTag}(gave up after ${retries + 1} attempt(s) on provider "${cfg.provider}")`;

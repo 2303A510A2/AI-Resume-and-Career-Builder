@@ -41,6 +41,33 @@ const MAX_BUDGET_CAP = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 32768);
 // with a correct budget; rather than shipping a cut-off answer we ask for the
 // remainder and merge it. Bounded and internal — never shown to the user.
 const MAX_CONTINUATIONS = Math.max(0, Math.min(6, Number(process.env.LLM_MAX_CONTINUATIONS || 5)));
+const MAX_CONTINUATION_RATE_RETRIES = Math.max(0, Math.min(3, Number(process.env.LLM_CONTINUATION_RATE_RETRIES || 2)));
+const CONTINUATION_RATE_LIMIT_MAX_WAIT_MS = Math.max(
+  0,
+  Number(process.env.LLM_CONTINUATION_RATE_LIMIT_MAX_WAIT_MS || process.env.LLM_RATE_LIMIT_MAX_WAIT_MS || 40000)
+);
+const CONTINUATION_RETRY_BASE_MS = 800;
+
+const continuationRetryDelay = (attempt, retryAfterMs = 0) => {
+  const exponential = CONTINUATION_RETRY_BASE_MS * (2 ** attempt);
+  const jitter = Math.round(Math.random() * 250);
+  const hinted = Number(retryAfterMs) > 0 ? Number(retryAfterMs) : 0;
+  return Math.min(Math.max(exponential, hinted) + jitter, CONTINUATION_RATE_LIMIT_MAX_WAIT_MS);
+};
+
+const waitForContinuationRetry = (attempt, error) => {
+  const delay = continuationRetryDelay(attempt, error && error.retryAfterMs);
+  if (!delay) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delay));
+};
+
+const isAutoContinuationRetryable = (error) =>
+  Boolean(error && error.retryable !== false && [
+    'AI_RATE_LIMITED',
+    'AI_PROVIDER_ERROR',
+    'AI_PROVIDER_UNAVAILABLE',
+    'AI_UNREACHABLE',
+  ].includes(String(error.code || '')));
 
 // History trimming. The old code clipped EVERY message to 1200 chars, which threw
 // away the previous answer's items — "make it 20" / "10 more" / "explain number 5"
@@ -687,35 +714,45 @@ ${buildDirective(req)}`;
 
       const contBudget = continuationBudget(req, check, MAX_BUDGET_CAP);
       let extra = '';
-      try {
-        continuationAttempts += 1;
-        const contMessages = [
-          { role: 'system', content: `${baseSystem}${CONTINUATION_SYSTEM_TAIL}` },
-          ...messages.slice(1),
-          { role: 'assistant', content: answer },
-          { role: 'user', content: buildContinuationPrompt({ req, check, question }) },
-        ];
-        const r = await llmService.chat({
-          messages: contMessages,
-          temperature,
-          maxTokens: contBudget,
-          requestId,
-          onDelta,
-          abortSignal,
-          returnMeta: true,
-          // Continue on the SAME provider that produced the partial answer — the
-          // primary is not re-probed if the fallback rescued the first pass.
-          ...(activeProvider ? { preferProvider: activeProvider, preferModel: activeModel || undefined } : {}),
-        });
-        extra = String(r.content || '');
-        providerTruncated = Boolean(r.truncated);
-        providerCancelled = Boolean(r.cancelled);
-        providerFinishReason = String(r.finishReason || '');
-      } catch (err) {
+      let continuationError = null;
+      const contMessages = [
+        { role: 'system', content: `${baseSystem}${CONTINUATION_SYSTEM_TAIL}` },
+        ...messages.slice(1),
+        { role: 'assistant', content: answer },
+        { role: 'user', content: buildContinuationPrompt({ req, check, question }) },
+      ];
+      for (let retry = 0; retry <= MAX_CONTINUATION_RATE_RETRIES; retry += 1) {
+        try {
+          continuationAttempts += 1;
+          const r = await llmService.chat({
+            messages: contMessages,
+            temperature,
+            maxTokens: contBudget,
+            requestId,
+            onDelta,
+            abortSignal,
+            returnMeta: true,
+            // Continue on the SAME provider that produced the partial answer —
+            // the primary is not re-probed if the fallback rescued the first pass.
+            ...(activeProvider ? { preferProvider: activeProvider, preferModel: activeModel || undefined } : {}),
+          });
+          extra = String(r.content || '');
+          providerTruncated = Boolean(r.truncated);
+          providerCancelled = Boolean(r.cancelled);
+          providerFinishReason = String(r.finishReason || '');
+          continuationError = null;
+          break;
+        } catch (err) {
+          continuationError = err;
+          if (!isAutoContinuationRetryable(err) || retry >= MAX_CONTINUATION_RATE_RETRIES) break;
+          await waitForContinuationRetry(retry, err);
+        }
+      }
+      if (continuationError) {
         // A continuation failure must NEVER destroy an answer we already have.
-        continuationFailure = err && err.requestTooLarge
+        continuationFailure = continuationError.requestTooLarge
           ? 'AI_REQUEST_TOO_LARGE'
-          : String((err && err.code) || 'AI_PROVIDER_ERROR');
+          : String(continuationError.code || 'AI_PROVIDER_ERROR');
         console.warn(
           `[AI] continuation ${guard}/${MAX_CONTINUATIONS} failed, keeping the existing answer (${continuationFailure})`
         );

@@ -26,6 +26,7 @@
 // Run: node scripts/chatPathTest.js
 /* eslint-disable no-console */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+process.env.LLM_CONTINUATION_RATE_LIMIT_MAX_WAIT_MS = '1';
 
 const llmService = require('../services/llmService');
 
@@ -57,7 +58,7 @@ const ok = (name, cond, detail = '') => {
  * real llmService returns it. `failAfter` makes a call throw instead, to prove
  * a failed continuation never destroys an answer that already exists.
  */
-const runChat = async ({ question, history = [], attachedImages = [], replies = [], failAfter = null }) => {
+const runChat = async ({ question, history = [], attachedImages = [], replies = [], failAfter = null, failSequence = [] }) => {
   const calls = [];
   const realChat = llmService.chat;
   const realChatWithBrowserSearch = llmService.chatWithBrowserSearch;
@@ -66,6 +67,7 @@ const runChat = async ({ question, history = [], attachedImages = [], replies = 
   const nextReply = (opts, via) => {
     calls.push({ via, maxTokens: opts.maxTokens, messages: opts.messages, preferProvider: opts.preferProvider || '', preferModel: opts.preferModel || '' });
     const n = calls.length - 1;
+    if (failSequence[n]) throw failSequence[n];
     if (failAfter !== null && n >= failAfter) {
       const err = new Error('stub provider failure');
       err.code = 'AI_UNREACHABLE';
@@ -319,6 +321,25 @@ const main = async () => {
     ok('a continuation error does not surface to the user', r.error === null, r.error ? `${r.error.name}: ${r.error.message}` : 'clean run');
     ok('the original partial answer is still returned', /Item 5\b/.test(r.answer), `${r.answer.replace(/\n/g, ' ').slice(0, 60)}`);
     ok('a failed continuation is explicitly marked incomplete', r.completion && r.completion.complete === false, JSON.stringify(r.completion));
+  }
+
+  console.log('\n11b) A temporary continuation rate limit resumes automatically');
+  {
+    const first = Array.from({ length: 77 }, (_, i) => `${i + 1}. LeetCode problem ${i + 1}`).join('\n');
+    const rest = Array.from({ length: 23 }, (_, i) => `${i + 78}. LeetCode problem ${i + 78}`).join('\n');
+    const limited = new Error('temporary provider rate limit');
+    limited.code = 'AI_RATE_LIMITED';
+    limited.retryable = true;
+    limited.rateLimitKind = 'tokens';
+    const r = await runChat({ question: 'give me 100 LeetCode problems', replies: [first, rest], failSequence: [null, limited] });
+    ok('a temporary continuation rate limit does not lose the partial answer', r.error === null && /problem 77\b/.test(r.answer));
+    ok('automatic retry resumes at the next missing item', /problem 78\b/.test(r.answer) && /problem 100\b/.test(r.answer), `calls=${r.calls.length}`);
+    const numbers = [...r.answer.matchAll(/^\s*(\d+)\./gm)].map((m) => Number(m[1]));
+    ok('automatic retry preserves continuous numbering without duplicates',
+      numbers.length === 100 && numbers.every((n, i) => n === i + 1) && new Set(numbers).size === 100,
+      `${numbers.length} numbered items`);
+    ok('automatic retry reports complete 100/100 progress', r.completion && r.completion.complete === true
+      && r.completion.produced === 100 && r.completion.target === 100, JSON.stringify(r.completion));
   }
 
   console.log('\n12) A fully complete answer costs exactly ONE provider call');
