@@ -4822,7 +4822,7 @@ function backendErrorText(err) {
      could help — a spent daily quota (retryable:false) hides the button. */
   if (api === "AI_PROVIDERS_UNAVAILABLE") {
     return {
-      text: "**AI services are temporarily unavailable.**\n\nPlease try again shortly.",
+      text: "**All configured AI providers are currently unavailable or have reached their usage limits.**\n\nPlease try again later.",
       retryable: err.retryable !== false,
     };
   }

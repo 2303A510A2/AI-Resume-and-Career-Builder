@@ -145,7 +145,7 @@ const friendlyError = async (err) => {
   // could help (both failures were transient). A spent daily quota keeps it off.
   if (code === 'AI_PROVIDERS_UNAVAILABLE') {
     return {
-      text: 'AI services are temporarily unavailable. Please try again shortly.',
+      text: 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.',
       signOut: false,
       retryable: err?.response?.data?.retryable !== false,
     };

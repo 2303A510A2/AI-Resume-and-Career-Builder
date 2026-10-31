@@ -324,20 +324,24 @@ This is a complete, runnable full-stack application — not a scaffold.
   the fallback is a CHAIN — `LLM_FALLBACK2_*` (same rules, own key required, one
   attempt per slot) is tried after slot 1, so one user message costs at most
   1 primary + 2 fallback fetches and an error only when EVERY configured
-  provider fails (a 3-deep daily 429 chain surfaces the honest quota message; a
-  3-deep 503 chain surfaces the outage wording, still retryable); when the whole
-  chain fails the error surfaces the
-  TRUE cause: if a daily-quota error is involved on any side it is the honest
-  `AI_DAILY_LIMIT` ("Today's AI provider quota has been reached…",
-  `retryable:false`, `usedFallback:true` — a spent daily allowance is NEVER
-  labeled a transient outage), otherwise `AI_PROVIDERS_UNAVAILABLE` (502, §10
-  "AI services are temporarily unavailable. Please try again shortly.",
-  `retryable` = true ONLY when every component failure could recover);
+  provider fails (a 3-deep daily 429 chain AND a 3-deep 503 chain both surface
+  the SAME exact all-fail message); when the whole
+  chain fails the surfaced error is `AI_PROVIDERS_UNAVAILABLE` (502) with the
+  exact wording "All configured AI providers are currently unavailable or have
+  reached their usage limits. Please try again later.", tagged
+  `usedFallback:true`, with `retryable` = true ONLY when no daily quota was
+  involved AND every component failure could recover (daily-involved -> false).
+  The single-provider (no fallback configured) daily 429 keeps its own honest
+  `AI_DAILY_LIMIT` message, and an all-413 chain still surfaces
+  `AI_REQUEST_TOO_LARGE`; only those two narrow cases bypass the generic
+  all-fail wording;
   a pinned continuation (`preferProvider`/`preferModel`) resolves against the
   primary AND every configured chain slot, costs EXACTLY one
   fetch to the survivor and is never re-fallen-back; and `[AI] Primary
-  provider: <id>` / `[AI] Primary provider unavailable: <id> / Fallback
-  provider: <id>` / `[AI FALLBACK] provider=<id> model=<id>` (one line per
+  provider: <Name>` / `[AI] <Name> quota exceeded.|unavailable.` / `[AI]
+  Switching to <Name>.` / `[AI] <Name> response successful.` / `[AI] Primary
+  provider unavailable: <id> / Fallback provider: <id>` / `[AI] All configured
+  AI providers failed.` / `[AI FALLBACK] provider=<id> model=<id>` (one line per
   chain slot) log the switch
   without any secret material. It also asserts
   that one user message
@@ -361,7 +365,14 @@ This is a complete, runnable full-stack application — not a scaffold.
   `LLM_FALLBACK_MODEL` alone = same-key model swap; `LLM_FALLBACK_PROVIDER` /
   `_BASE_URL` / `_API_KEY` = a fully separate provider; slot 2 follows the
   same rules via `LLM_FALLBACK2_*`, so the app keeps answering whenever ANY
-  configured provider has quota). Each fallback attempt runs
+  configured provider has quota). A declared provider may use its OWN
+  conventional key alias instead of `LLM_FALLBACK*_API_KEY` — `OPENAI_API_KEY`,
+  `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, … — and a declared provider
+  with none of those is skipped, never sent the primary key. Gemini is supported
+  through its officially documented OpenAI-compatible root
+  `https://generativelanguage.googleapis.com/v1beta/openai` (model
+  `gemini-2.5-flash`); a native bare-host or `/v1beta` URL is normalized
+  automatically. Each fallback attempt runs
   EXACTLY ONCE, only after the primary exhausted its retries, and only for
   provider-availability codes (`allowsFallback`: AI_DAILY_LIMIT, AI_RATE_LIMITED,
   AI_PROVIDER_ERROR, AI_PROVIDER_UNAVAILABLE, AI_UNREACHABLE, AI_EMPTY_RESPONSE)
@@ -373,27 +384,36 @@ This is a complete, runnable full-stack application — not a scaffold.
   code is fallbackable (error cache: `err.providerHttpStatus` carries the RAW
   provider status). A spent daily quota is NOT retried on the primary — it goes
   straight to the chain, or surfaces the daily message when none exists. When
-  the WHOLE chain fails the surfaced error carries the TRUE cause: a daily-quota
-  failure on any side surfaces `AI_DAILY_LIMIT` ("Today's AI provider quota
-  has been reached…", `retryable:false`, `usedFallback:true`) — a spent daily
-  allowance must never be mislabeled "temporarily unavailable" (that bug put a
-  quota error behind the outage wording and invited pointless retries); only
-  non-quota chain-fails surface `AI_PROVIDERS_UNAVAILABLE` (502, §10 "AI
-  services are temporarily unavailable. Please try again shortly."), tagged
+  the WHOLE chain fails, EVERY cause (daily quota, per-minute limit, 5xx,
+  network, timeout) surfaces the SAME `AI_PROVIDERS_UNAVAILABLE` (502) error
+  with the exact message "All configured AI providers are currently unavailable
+  or have reached their usage limits. Please try again later.", tagged
   `usedFallback:true` (lets `chatWithBrowserSearch` degrade to a tool-free
-  answer), with `retryable` = true ONLY when EVERY component failure could
-  recover (daily-involved -> false). `chat`/`requestCompletion` accept
+  answer), with `retryable` = true ONLY when no daily quota was involved AND
+  every component failure could recover. The single-provider (no chain
+  configured) daily 429 keeps its honest `AI_DAILY_LIMIT` message, and an
+  all-413 chain keeps `AI_REQUEST_TOO_LARGE`. `chat`/`requestCompletion` accept
   `preferProvider`/`preferModel` (resolved against the primary OR any configured
   chain slot, no
   inline fallback when pinned); `ragService` returns the answering provider in
   the chat meta and pins every continuation turn to it, so a long answer that
   survived on the fallback continues on the fallback — never re-probing a dead
-  primary (§6/§7/§8). Dev logs: `[AI] Primary provider: <id>` then, on a
-  switch, `[AI] Primary provider unavailable: <id> / Fallback provider: <id>`
-  plus one `[AI FALLBACK] provider=<id> model=<id>` line per chain slot —
-  names only, never keys. `errorMiddleware` now echoes `err.retryable` to the
+  primary (§6/§7/§8). Dev logs: `[AI] Primary provider: <Name>` then, on a
+  switch, `[AI] <Name> quota exceeded.|unavailable.`, `[AI] Switching to
+  <Name>.`, `[AI] <Name> response successful.`, the legacy `[AI] Primary
+  provider unavailable: <id> / Fallback provider: <id>` line, `[AI] All
+  configured AI providers failed.`, plus one `[AI FALLBACK] provider=<id>
+  model=<id>` line per chain slot — names only, never keys. `errorMiddleware`
+  now echoes `err.retryable` to the
   client body so both frontends gate the Retry button per-error (chain-failed =
   backend-decided; daily = always off).
+  `backend\scripts\providerFallbackTest.js` (**68/68**, offline, stubbed fetch)
+  is the dedicated Groq→OpenAI→Gemini contract: Groq healthy, Groq→OpenAI,
+  Groq+OpenAI→Gemini, all-fail exact message (quota and 503), 401 never
+  switches, network/timeout switches, byte-identical messages/temperature/
+  max_tokens/tools across providers, own key per provider, URL/model assertions,
+  Gemini URL repair, key aliases, incomplete-slot exclusion, and a log scan
+  proving no key/Bearer material.
   `backend\scripts\dedupLiveTest.js` is the live counterpart (needs the backend
   on :5000 + a real key): register -> POST with requestId R (`200`,
   `deduped:false`, real answer) -> the SAME requestId (`200`, `deduped:true`,

@@ -198,6 +198,8 @@ app.get('/api/health', async (req, res) => {
     aiProviderDetail: ai.detail,
     aiProviderHttpStatus: ai.httpStatus,
     aiProviderErrorCategory: ai.errorCategory,
+    // Safe fallback chain (provider names/models only — never a key or URL).
+    aiFallbackChain: llmService.describe().fallbackChain,
     message: 'AI Resume Career Builder API is running',
     services: {
       database: mongodbConnected ? 'connected' : 'disconnected',
@@ -209,6 +211,7 @@ app.get('/api/health', async (req, res) => {
       providerErrorCategory: ai.errorCategory,
       model: ai.model,
       aiModelAvailable: ai.modelAvailable,
+      aiFallbackChain: llmService.describe().fallbackChain,
       embeddings: embeddingService.isConfigured() ? 'configured' : 'not-configured',
       webSearch: webSearchService.status(),
       ocr: 'not-configured',
@@ -310,6 +313,17 @@ const start = async () => {
     console.log(`   AI API key:  ${ai.apiKeyConfigured ? 'configured' : 'not-configured'}`);
     console.log(`   AI model:    ${ai.model}`);
     console.log(`   AI base URL: ${ai.baseUrl}`);
+    if (ai.fallbackChain && ai.fallbackChain.length) {
+      console.log(`   Fallbacks:   ${ai.fallbackChain.map((f, i) => `slot ${i + 1}=${f.provider}/${f.model}`).join(' -> ')}`);
+    } else {
+      console.log('   Fallbacks:   not-configured (only the primary provider will be tried)');
+    }
+    if (ai.fallback1Declared && !ai.fallback1Configured) {
+      console.log('   ⚠️  LLM_FALLBACK_* is declared but incomplete — set LLM_FALLBACK_API_KEY (or the provider key, e.g. OPENAI_API_KEY). It will NOT be used.');
+    }
+    if (ai.fallback2Declared && !ai.fallback2Configured) {
+      console.log('   ⚠️  LLM_FALLBACK2_* is declared but incomplete — set LLM_FALLBACK2_API_KEY (or the provider key, e.g. GEMINI_API_KEY). It will NOT be used.');
+    }
     if (!ai.apiKeyConfigured && ai.provider !== 'ollama') {
       console.log('   ⚠️  Add LLM_API_KEY=gsk_... to backend/.env to enable REAL AI chat.');
       console.log('   ⚠️  Until then, /api/ai/career-assistant returns an honest 503 — no fake answers.');

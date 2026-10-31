@@ -246,6 +246,30 @@ const allowsFallback = (err) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Human-readable provider names for the safe fallback trace logs. NEVER a key,
+// endpoint or model credential — just the product name of the provider.
+const PROVIDER_LABELS = {
+  groq: 'Groq',
+  openai: 'OpenAI',
+  gemini: 'Gemini',
+  openrouter: 'OpenRouter',
+  deepseek: 'DeepSeek',
+  together: 'Together',
+  ollama: 'Ollama',
+};
+const providerLabel = (id) => {
+  const key = String(id || '').trim().toLowerCase();
+  if (PROVIDER_LABELS[key]) return PROVIDER_LABELS[key];
+  if (!key) return 'AI provider';
+  return key.charAt(0).toUpperCase() + key.slice(1);
+};
+
+// The ONE message the user sees when every configured provider in the chain
+// failed. Deliberately generic: it never leaks a provider name, URL, key or raw
+// provider body, and it covers both an outage and a spent usage limit.
+const ALL_PROVIDERS_FAILED_MESSAGE =
+  'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.';
+
 // Safe development diagnostics (§12): [AI REQUEST] / [AI RESPONSE] / [AI ERROR].
 // OFF in production, and never prints the key, Authorization header, JWT,
 // prompt/body or MongoDB credentials — only provider, model, requestId, status,
@@ -1030,7 +1054,7 @@ const requestCompletion = async ({
     }
   }
   // Safe provider-status diagnostics (§9): names only, never keys/auth material.
-  if (DEV_LOG) console.log(`[AI] Primary provider: ${cfg.provider}`);
+  if (DEV_LOG) console.log(`[AI] Primary provider: ${providerLabel(cfg.provider)}`);
 
   const first = await attemptWithProvider(cfg, {
     messages,
@@ -1057,11 +1081,20 @@ const requestCompletion = async ({
   // there) — a clean "AI temporarily busy" beats a confusing provider error.
   const fallbackChain = noFallback ? [] : getFallbackChain();
   if (fallbackChain.length && allowsFallback(first.error)) {
-    if (DEV_LOG) console.log(`[AI] Primary provider unavailable: ${cfg.provider} / Fallback provider: ${fallbackChain[0].provider}`);
+    const primaryLabel = providerLabel(cfg.provider);
+    if (DEV_LOG) {
+      const primaryKind = first.error && first.error.rateLimitKind === 'daily' ? 'quota exceeded' : 'unavailable';
+      console.log(`[AI] ${primaryLabel} ${primaryKind}.`);
+      console.log(`[AI] Primary provider unavailable: ${cfg.provider} / Fallback provider: ${fallbackChain[0].provider}`);
+    }
     const chainAttempts = [];
     let chainErr = null;
-    for (const fb of fallbackChain) {
-      if (DEV_LOG) console.log(`[AI FALLBACK] provider=${fb.provider} model=${fb.model}`);
+    for (let i = 0; i < fallbackChain.length; i += 1) {
+      const fb = fallbackChain[i];
+      if (DEV_LOG) {
+        console.log(`[AI] Switching to ${providerLabel(fb.provider)}.`);
+        console.log(`[AI FALLBACK] provider=${fb.provider} model=${fb.model}`);
+      }
       const attempt = await attemptWithProvider(fb, {
         messages,
         temperature,
@@ -1074,42 +1107,33 @@ const requestCompletion = async ({
         abortSignal,
       });
       if (attempt.ok) {
+        if (DEV_LOG) console.log(`[AI] ${providerLabel(fb.provider)} response successful.`);
         aiLog({ requestId, provider: fb.provider, model: fb.model, status: 200, durationMs: attempt.value.durationMs, attempts: attempt.value.attempts, category: 'OK' });
         return attempt.value;
       }
       chainAttempts.push({ cfg: fb, attempt });
       chainErr = attempt.error || chainErr;
+      if (DEV_LOG) {
+        const kind = attempt.error && attempt.error.rateLimitKind === 'daily' ? 'quota exceeded' : 'unavailable';
+        console.log(`[AI] ${providerLabel(fb.provider)} ${kind}.`);
+      }
     }
+    if (DEV_LOG) console.log('[AI] All configured AI providers failed.');
     const fallbackErr = chainErr || apiError('The AI fallback provider failed.', 502, 'AI_PROVIDER_ERROR');
     const triedNames = [cfg.provider, ...chainAttempts.map((x) => x.cfg.provider)];
     const triedCodes = [first.error && first.error.code || 'error', ...chainAttempts.map((x) => (x.attempt.error ? x.attempt.error.code || 'error' : 'error'))];
-    // A spent DAILY quota on ANY tried provider is the true cause: the account's
-    // per-day token allowance is gone and cannot come back inside this request.
-    // Labeling that with the generic "temporarily unavailable" wording hides a
-    // quota error behind an outage message (and invites pointless retries), so
-    // the honest quota error is surfaced instead — retryable:false, no Retry.
+    // A spent DAILY quota on ANY tried provider means this request cannot recover
+    // inside its own lifetime — it must never offer a Retry button that cannot
+    // work until the provider's window resets.
     const dailyInvolved = triedCodes.includes('AI_DAILY_LIMIT');
-    const allNetworkFailures = [first.error, ...chainAttempts.map((x) => x.attempt.error)]
-      .every((error) => error && error.code === 'AI_UNREACHABLE');
     // EVERY provider rejected the request as TOO LARGE (Groq 413). That is the
-    // true cause and the one case the generic "temporarily unavailable" wording
+    // true cause and the one case the generic "providers unavailable" wording
     // gets wrong: retrying an oversized request can never help.
     const allTooLarge =
       Boolean(first.error && first.error.requestTooLarge) &&
       chainAttempts.every((x) => x.attempt.error && x.attempt.error.requestTooLarge);
     const allRecoverable = [first.error, ...chainAttempts.map((x) => x.attempt.error)].every((e) => !e || e.retryable !== false);
-    aiLog({ requestId, provider: cfg.provider, model: cfg.model, status: fallbackErr.statusCode || 502, attempts: chainAttempts.length ? chainAttempts[chainAttempts.length - 1].attempt.attempts : 1, category: aiCategoryFromCode(dailyInvolved ? 'AI_DAILY_LIMIT' : allTooLarge ? 'AI_REQUEST_TOO_LARGE' : 'AI_PROVIDERS_UNAVAILABLE') });
-    if (dailyInvolved) {
-      const quotaErr = dailyQuotaError({
-        provider: triedNames.join(' + '),
-        bodyText: (fallbackErr && fallbackErr.detail) || (first.error && first.error.detail) || '',
-        retryAfterMs: Math.max(first.retryAfterMs || 0, ...chainAttempts.map((x) => x.attempt.retryAfterMs || 0)),
-        extraDetail: `${reqTag}(every configured provider was tried: ${triedNames.map((n, i) => `"${n}" -> ${triedCodes[i]}`).join(', ')}; the daily token allowance is the limiting cause)`,
-        reqTag,
-      });
-      quotaErr.usedFallback = true; // lets chatWithBrowserSearch degrade to plain chat
-      throw quotaErr;
-    }
+    aiLog({ requestId, provider: cfg.provider, model: cfg.model, status: fallbackErr.statusCode || 502, attempts: chainAttempts.length ? chainAttempts[chainAttempts.length - 1].attempt.attempts : 1, category: aiCategoryFromCode(allTooLarge ? 'AI_REQUEST_TOO_LARGE' : 'AI_PROVIDERS_UNAVAILABLE') });
     if (allTooLarge) {
       // The request is bigger than the provider's whole per-minute window, so no
       // provider in the chain can fit it and no retry can. Say so plainly, with
@@ -1124,26 +1148,20 @@ const requestCompletion = async ({
       tooLarge.usedFallback = true; // lets chatWithBrowserSearch degrade to a plain answer
       throw tooLarge;
     }
-    if (allNetworkFailures) {
-      const unreachable = apiError(
-        'The backend could not connect to the configured AI provider. Check outbound HTTPS access and the provider connection settings, then try again.',
-        503,
-        'AI_UNREACHABLE',
-        `${reqTag}all configured providers failed before returning an HTTP response`
-      );
-      unreachable.retryable = allRecoverable;
-      unreachable.usedFallback = true;
-      throw unreachable;
-    }
-    // ALL providers failed without quota exhaustion or an oversized request: one
-    // calm, honest message (never a raw provider error, never another chain).
+    // The whole configured chain (primary + every fallback) failed. Surface ONE
+    // calm, exact message regardless of the individual causes — an outage, a
+    // spent daily allowance and a per-minute limit are indistinguishable to the
+    // user, and every raw provider body/name stays server-side. A quota failure
+    // anywhere in the chain is never retryable (the allowance cannot come back
+    // inside this request); otherwise retryable only if every failure could
+    // recover.
     const allFailed = apiError(
-      'AI services are temporarily unavailable. Please try again shortly.',
+      ALL_PROVIDERS_FAILED_MESSAGE,
       502,
       'AI_PROVIDERS_UNAVAILABLE',
       `${reqTag}(${triedNames.map((n, i) => `provider "${n}" failed with ${triedCodes[i]}`).join('; ')})`
     );
-    allFailed.retryable = allRecoverable;
+    allFailed.retryable = allRecoverable && !dailyInvolved;
     allFailed.usedFallback = true; // lets chatWithBrowserSearch degrade to plain chat
     throw allFailed;
   }
@@ -1584,6 +1602,12 @@ const describe = () => {
     apiKeyConfigured: p.apiKeyConfigured,
     configured: p.configured,
     fallback: p.fallback ? { provider: p.fallback.provider, model: p.fallback.model } : null,
+    fallback2: p.fallback2 ? { provider: p.fallback2.provider, model: p.fallback2.model } : null,
+    fallbackChain: p.fallbackChain,
+    fallback1Declared: p.fallback1Declared,
+    fallback1Configured: p.fallback1Configured,
+    fallback2Declared: p.fallback2Declared,
+    fallback2Configured: p.fallback2Configured,
     vision: p.vision,
   };
 };
@@ -1617,4 +1641,6 @@ module.exports = {
   rateLimitKind,
   isDailyQuotaExhausted,
   classifyStatus,
+  providerLabel,
+  ALL_PROVIDERS_FAILED_MESSAGE,
 };

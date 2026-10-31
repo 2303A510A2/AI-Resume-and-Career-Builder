@@ -415,11 +415,25 @@ REST API — no simulated AI replies anywhere. Real end-to-end chat flow:
   errors (401/403/404). When the primary is still unavailable after its retries
   and `LLM_FALLBACK_*`/`LLM_FALLBACK2_*` are configured, the fallback CHAIN runs —
   one attempt per slot (primary → slot 1 → slot 2) — before the clean message is returned (provider config is centralized in
-  `backend/services/providers.js`). Raw provider URLs/keys are never shown to
-  users. The frontend renders exactly two product strings on failure: "The AI is
-  temporarily busy. Please try again shortly." (429) or "I'm having trouble
-  generating that response right now. Please try again." with a **Try Again**
-  button.
+  `backend/services/providers.js`). The recommended deployment is
+  **Groq → OpenAI → Gemini**: Groq is the primary, `LLM_FALLBACK_*` points at
+  OpenAI (`https://api.openai.com/v1`, `gpt-4o-mini`) and `LLM_FALLBACK2_*` at
+  Gemini's officially supported OpenAI-compatible endpoint
+  (`https://generativelanguage.googleapis.com/v1beta/openai`,
+  `gemini-2.5-flash`). Each slot uses its OWN key — `LLM_FALLBACK*_API_KEY`, or
+  the provider's conventional `OPENAI_API_KEY` / `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY` / `GROQ_API_KEY` — and a declared provider without a key is
+  skipped rather than sent the primary key. Only quota/rate-limit/5xx/network/
+  timeout/empty-response failures switch providers; raw 401/403/404/400 errors
+  never do. When every configured provider fails, the UI shows exactly:
+  **"All configured AI providers are currently unavailable or have reached their
+  usage limits. Please try again later."** (no Retry button when a daily quota
+  was involved). Raw provider URLs/keys are never shown to users.
+  `GET /api/health` exposes the resolved chain as `aiFallbackChain` (names and
+  models only) and the startup log prints it too. The frontend renders exactly two
+  product strings on failure: "The AI is temporarily busy. Please try again
+  shortly." (429) or "I'm having trouble generating that response right now.
+  Please try again." with a **Try Again** button.
 - Duplicate protection: the frontend generates a fresh `requestId` per message
   and refuses to send while a request is in flight (button/Enter disabled,
   stale-response guard); the backend dedups `${userId}:${requestId}` for
@@ -600,18 +614,23 @@ LLM_TIMEOUT_MS=60000           # ~60s per attempt (optional)
 LLM_MAX_RETRIES=2              # transient-failure retries (optional)
 REQUEST_DEDUP_TTL_MS=60000     # in-memory requestId dedup window (duplicate protection)
 # Optional FALLBACK AI providers — automatic CHAIN used ONLY when the primary is
-# temporarily unavailable after its retries (rate limits / 5xx / network). Each
-# slot must have its OWN key; never reuses the primary silently:
-LLM_FALLBACK_PROVIDER=
-LLM_FALLBACK_BASE_URL=
-LLM_FALLBACK_MODEL=
-LLM_FALLBACK_API_KEY=
-# Slot 2 of the chain (fully optional): a SECOND independent provider. Same
-# rules; an error is shown only when EVERY configured provider fails:
-LLM_FALLBACK2_PROVIDER=
-LLM_FALLBACK2_BASE_URL=
-LLM_FALLBACK2_MODEL=
-LLM_FALLBACK2_API_KEY=
+# temporarily unavailable after its retries (daily/per-minute limits, 5xx,
+# network, timeout, empty response). Raw 401/403/404/400 never switch providers.
+# Each slot must have its OWN key (or the provider's conventional key:
+# OPENAI_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / GROQ_API_KEY); a declared
+# provider without a key is skipped, never sent the primary key.
+# Recommended: Groq -> OpenAI -> Gemini.
+LLM_FALLBACK_PROVIDER=openai
+LLM_FALLBACK_BASE_URL=https://api.openai.com/v1
+LLM_FALLBACK_MODEL=gpt-4o-mini
+LLM_FALLBACK_API_KEY=sk-...
+# Slot 2 of the chain: Gemini's officially supported OpenAI-compatible endpoint
+# (a native /v1beta or bare-host URL is repaired automatically). An error is
+# shown only when EVERY configured provider fails.
+LLM_FALLBACK2_PROVIDER=gemini
+LLM_FALLBACK2_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+LLM_FALLBACK2_MODEL=gemini-2.5-flash
+LLM_FALLBACK2_API_KEY=AIza...
 # Vision (image analysis in chat): 1 + a vision-CAPABLE model => attached images
 # are really analyzed. The default qwen/qwen3.8-27b is vision-capable on Groq
 # (verified), so images are analyzed out of the box. gpt-oss-120b = text-only;
@@ -650,7 +669,8 @@ node scripts/cleanupDemoChats.js   # dev-only: removes old "SIMULATED DEMO REPLY
 node scripts/smokeTest.js          # 77 assertions, 0 failures (end-to-end)
 node scripts/outputRequirementsTest.js  # 151/151 output-requirement engine checks (no server/key needed)
 node scripts/chatPathTest.js       # 73/73 chat-path + continuation checks, stubbed provider (no server/key/DB)
-node scripts/providerErrorTest.js  # 168/168 provider-error + fallback-chain + retry-honoring + 413 checks, stubbed fetch (no server/key/DB)
+node scripts/providerErrorTest.js  # 178/178 provider-error + fallback-chain + retry-honoring + 413 checks, stubbed fetch (no server/key/DB)
+node scripts/providerFallbackTest.js # 68/68 Groq->OpenAI->Gemini fallback contract, stubbed fetch (no server/key/DB)
 node scripts/responseQualityTest.js # live "did it fulfil the request?" suite (needs quota)
 node scripts/intentTest.js         # 68/68 image-intent detector checks (no server needed)
 node scripts/imageTest.js          # image end-to-end suite (needs a running backend)
