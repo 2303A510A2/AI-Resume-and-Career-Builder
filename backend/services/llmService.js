@@ -102,7 +102,7 @@ const runWithProviderSlot = async (provider, fn, abortSignal) => {
       throw error;
     }
     await new Promise((resolve, reject) => {
-      const waiter = { resolve, reject, abortHandler: null };
+      const waiter = { resolve, reject, abortHandler: null, signal: abortSignal };
       waiter.abortHandler = () => {
         const index = slot.waiters.indexOf(waiter);
         if (index >= 0) slot.waiters.splice(index, 1);
@@ -126,7 +126,7 @@ const runWithProviderSlot = async (provider, fn, abortSignal) => {
     slot.active -= 1;
     const next = slot.waiters.shift();
     if (next) {
-      next.abortHandler && abortSignal?.removeEventListener('abort', next.abortHandler);
+      next.abortHandler && next.signal?.removeEventListener('abort', next.abortHandler);
       next.resolve();
     }
   }

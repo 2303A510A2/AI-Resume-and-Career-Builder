@@ -27,6 +27,9 @@
 /* eslint-disable no-console */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 process.env.LLM_CONTINUATION_RATE_LIMIT_MAX_WAIT_MS = '1';
+// This suite exercises the provider-backed continuation path. Deterministic
+// computation has its own focused suite and is intentionally disabled here.
+process.env.DISABLE_DETERMINISTIC_ROUTING = '1';
 
 const llmService = require('../services/llmService');
 

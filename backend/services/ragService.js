@@ -340,7 +340,9 @@ const askCareerAssistant = async ({
   // Exact arithmetic/table requests do not need a provider. This is deliberately
   // conservative: only explicit multiplication-table wording is handled here;
   // database tables, explanations, and ambiguous math stay on the LLM path.
-  const deterministic = tryDeterministic(question);
+  const deterministic = process.env.DISABLE_DETERMINISTIC_ROUTING === '1'
+    ? null
+    : tryDeterministic(question);
   if (deterministic) {
     if (typeof onDelta === 'function') {
       const chunkSize = 1200;
