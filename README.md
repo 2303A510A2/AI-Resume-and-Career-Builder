@@ -301,6 +301,12 @@ polymorphism" are answered from the model's own knowledge with no knowledge-base
 block in the prompt, and follow-ups ("give me 10 more", "who is Karri?") keep the
 previous answer's context instead of a 1200-character slice of it.
 
+Unambiguous multiplication-table requests are handled by a small deterministic
+backend path (`backend/services/deterministicService.js`) so they are immediate
+and mathematically exact. It only matches explicit multiplication/times-table
+wording; database tables and general mathematical explanations continue through
+the normal intent, RAG, and provider pipeline.
+
 `backend/scripts/outputRequirementsTest.js` is the deterministic suite for this
 whole engine — **151 assertions**, no server, key or database needed: quantity
 and range detection across phrasings, word-count modes, format selection, the

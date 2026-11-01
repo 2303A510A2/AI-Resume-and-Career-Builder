@@ -7,6 +7,7 @@ process.env.LLM_CONTINUATION_RATE_LIMIT_MAX_WAIT_MS = '1';
 const assert = require('assert');
 const llmService = require('../services/llmService');
 const ragService = require('../services/ragService');
+const { tryDeterministic } = require('../services/deterministicService');
 
 let passed = 0;
 const ok = (name, condition, detail = '') => {
@@ -56,13 +57,10 @@ const chunked = (label, size, total) => (call) => {
 };
 
 const main = async () => {
-  const tables = await run({
-    question: 'Give me 20 multiplication tables.',
-    reply: chunked('Multiplication table', 10, 20),
-  });
+  const tables = tryDeterministic('Give me 20 multiplication tables.');
   ok('20 multiplication tables are complete', tables.completion.complete === true);
   ok('20 multiplication tables contain all requested markers', tables.completion.produced === 20);
-  ok('table items are distinct', new Set(tables.answer.match(/^\d+\./gm)).size === 20);
+  ok('table items are distinct', new Set(tables.answer.match(/^### Table \d+$/gm)).size === 20);
 
   const problems = await run({
     question: 'Give me 100 LeetCode problems to solve.',

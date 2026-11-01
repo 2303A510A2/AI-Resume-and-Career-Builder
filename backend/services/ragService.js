@@ -7,6 +7,7 @@ const webSearch = require('./webSearchService');
 const { detectIntent } = require('./intentService');
 const { CAREER_ASSISTANT_SYSTEM, RESOURCE_GUIDE_SYSTEM } = require('./prompts');
 const { parseStructuredResponse, sanitizeUrl, liftInlineLinks } = require('./resourceService');
+const { tryDeterministic } = require('./deterministicService');
 const {
   analyzeRequest,
   planOutput,
@@ -335,6 +336,20 @@ const askCareerAssistant = async ({
   // big the output budget is, what the directive says, and whether the finished
   // answer is actually complete.
   const req = analyzeRequest({ question, history });
+
+  // Exact arithmetic/table requests do not need a provider. This is deliberately
+  // conservative: only explicit multiplication-table wording is handled here;
+  // database tables, explanations, and ambiguous math stay on the LLM path.
+  const deterministic = tryDeterministic(question);
+  if (deterministic) {
+    if (typeof onDelta === 'function') {
+      const chunkSize = 1200;
+      for (let i = 0; i < deterministic.answer.length; i += chunkSize) {
+        await onDelta(deterministic.answer.slice(i, i + chunkSize));
+      }
+    }
+    return deterministic;
+  }
 
   // ---- Automatic intent detection (no manual selection; history-aware) ----
   const intentInfo = detectIntent(question, history);
