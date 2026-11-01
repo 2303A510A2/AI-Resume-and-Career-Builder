@@ -74,6 +74,63 @@ const MIN_OUTPUT_TOKENS = 64;
 const DEFAULT_GROQ_INPUT_TOKEN_LIMIT = 8000;
 const DEFAULT_GROQ_OUTPUT_TOKEN_LIMIT = 1000;
 const DEFAULT_GENERIC_INPUT_TOKEN_LIMIT = 32768;
+const PROVIDER_MAX_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.LLM_PROVIDER_MAX_CONCURRENCY || 2)));
+const PROVIDER_MAX_QUEUE = Math.max(0, Math.min(100, Number(process.env.LLM_PROVIDER_MAX_QUEUE || 20)));
+
+// Keep a small, provider-keyed admission queue. This prevents several users (or
+// a browser retry) from consuming the same provider's RPM/TPM window at once,
+// while still allowing different providers in the fallback chain to run
+// independently.
+const providerSlots = new Map();
+
+const providerSlot = (provider) => {
+  const key = String(provider || 'unknown').toLowerCase();
+  if (!providerSlots.has(key)) providerSlots.set(key, { active: 0, waiters: [] });
+  return providerSlots.get(key);
+};
+
+const runWithProviderSlot = async (provider, fn, abortSignal) => {
+  const slot = providerSlot(provider);
+  if (slot.active >= PROVIDER_MAX_CONCURRENCY) {
+    if (slot.waiters.length >= PROVIDER_MAX_QUEUE) {
+      const error = apiError(
+        'The AI provider is busy processing other requests. Please try again shortly.',
+        503,
+        'AI_PROVIDER_BUSY'
+      );
+      error.retryable = true;
+      throw error;
+    }
+    await new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, abortHandler: null };
+      waiter.abortHandler = () => {
+        const index = slot.waiters.indexOf(waiter);
+        if (index >= 0) slot.waiters.splice(index, 1);
+        const error = apiError('The AI request was cancelled while waiting for the provider.', 499, 'AI_CANCELLED');
+        error.retryable = false;
+        reject(error);
+      };
+      if (abortSignal?.aborted) {
+        waiter.abortHandler();
+        return;
+      }
+      abortSignal?.addEventListener('abort', waiter.abortHandler, { once: true });
+      slot.waiters.push(waiter);
+    });
+  }
+
+  slot.active += 1;
+  try {
+    return await fn();
+  } finally {
+    slot.active -= 1;
+    const next = slot.waiters.shift();
+    if (next) {
+      next.abortHandler && abortSignal?.removeEventListener('abort', next.abortHandler);
+      next.resolve();
+    }
+  }
+};
 
 const estimateContentTokens = (content) => {
   if (Array.isArray(content)) {
@@ -228,6 +285,7 @@ const FALLBACKABLE_CODES = new Set([
   'AI_RATE_LIMITED',         // per-minute pressure after the primary gave up
   'AI_PROVIDER_ERROR',       // provider 5xx
   'AI_PROVIDER_UNAVAILABLE', // provider 503
+  'AI_PROVIDER_BUSY',        // bounded local admission queue is full
   'AI_UNREACHABLE',          // network / timeout
   'AI_EMPTY_RESPONSE',       // provider returned 200 with nothing usable
 ]);
@@ -1056,7 +1114,10 @@ const requestCompletion = async ({
   // Safe provider-status diagnostics (§9): names only, never keys/auth material.
   if (DEV_LOG) console.log(`[AI] Primary provider: ${providerLabel(cfg.provider)}`);
 
-  const first = await attemptWithProvider(cfg, {
+  const attempt = (target, options) =>
+    runWithProviderSlot(target.provider, () => attemptWithProvider(target, options), abortSignal);
+
+  const first = await attempt(cfg, {
     messages,
     temperature,
     maxTokens: budget,
@@ -1095,7 +1156,7 @@ const requestCompletion = async ({
         console.log(`[AI] Switching to ${providerLabel(fb.provider)}.`);
         console.log(`[AI FALLBACK] provider=${fb.provider} model=${fb.model}`);
       }
-      const attempt = await attemptWithProvider(fb, {
+      const fallbackAttempt = await attempt(fb, {
         messages,
         temperature,
         maxTokens: budget,
@@ -1106,15 +1167,15 @@ const requestCompletion = async ({
         onDelta,
         abortSignal,
       });
-      if (attempt.ok) {
+      if (fallbackAttempt.ok) {
         if (DEV_LOG) console.log(`[AI] ${providerLabel(fb.provider)} response successful.`);
-        aiLog({ requestId, provider: fb.provider, model: fb.model, status: 200, durationMs: attempt.value.durationMs, attempts: attempt.value.attempts, category: 'OK' });
-        return attempt.value;
+        aiLog({ requestId, provider: fb.provider, model: fb.model, status: 200, durationMs: fallbackAttempt.value.durationMs, attempts: fallbackAttempt.value.attempts, category: 'OK' });
+        return fallbackAttempt.value;
       }
-      chainAttempts.push({ cfg: fb, attempt });
-      chainErr = attempt.error || chainErr;
+      chainAttempts.push({ cfg: fb, attempt: fallbackAttempt });
+      chainErr = fallbackAttempt.error || chainErr;
       if (DEV_LOG) {
-        const kind = attempt.error && attempt.error.rateLimitKind === 'daily' ? 'quota exceeded' : 'unavailable';
+        const kind = fallbackAttempt.error && fallbackAttempt.error.rateLimitKind === 'daily' ? 'quota exceeded' : 'unavailable';
         console.log(`[AI] ${providerLabel(fb.provider)} ${kind}.`);
       }
     }

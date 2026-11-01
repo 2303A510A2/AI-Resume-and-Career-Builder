@@ -23,7 +23,7 @@ export const streamChatMessage = async (
   chatId,
   documentIds = [],
   requestId,
-  { signal, onDelta, onReplace } = {},
+  { signal, onDelta, onReplace, onProgress } = {},
 ) => {
   const token = getAuthToken();
   const response = await fetch(`${getApiBaseUrl()}/ai/career-assistant/stream`, {
@@ -66,6 +66,7 @@ export const streamChatMessage = async (
     try { payload = JSON.parse(data); } catch { return; }
     if (event === 'delta') onDelta?.(payload.text || '');
     else if (event === 'replace') onReplace?.(payload.text || '');
+    else if (event === 'progress') onProgress?.(payload);
     else if (event === 'complete') completed = payload.response;
     else if (event === 'error' || event === 'cancelled') {
       const error = new Error(payload.message || 'The AI stream ended before completion.');

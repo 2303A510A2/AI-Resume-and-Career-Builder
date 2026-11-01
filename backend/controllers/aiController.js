@@ -198,6 +198,7 @@ const handleCareerAssistant = async ({
   documentIds,
   forceImage = false,
   onDelta,
+  onProgress,
   abortSignal,
 }) => {
   // ---- Conversation (created or continued; always owned) ----
@@ -340,6 +341,7 @@ const handleCareerAssistant = async ({
     // language). These shape the answer but never override an explicit request.
     preferences: (req.userRecord && req.userRecord.settings && req.userRecord.settings.chat) || {},
     onDelta,
+    onProgress,
     abortSignal,
   });
 
@@ -461,6 +463,9 @@ const careerAssistantStream = async (req, res) => {
         onDelta: async (text) => {
           partial += String(text || '');
           if (!disconnected) sseEvent(res, 'delta', { text: String(text || '') });
+        },
+        onProgress: (progress) => {
+          if (!disconnected) sseEvent(res, 'progress', progress);
         },
         abortSignal: abortController.signal,
       })

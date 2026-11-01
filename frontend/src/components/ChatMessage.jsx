@@ -880,6 +880,11 @@ export default function ChatMessage({ msg, onRetry, onRegenerate, onRegenerateIm
       </div>
       <div className="chat-bubble">
         {renderMarkdown(String(msg?.content || ''))}
+        {msg?.streamingRequestId && msg?.streamingProgress?.target && !msg.streamingProgress.complete && (
+          <div className="chat-stream-progress" role="status">
+            Generating {msg.streamingProgress.produced || 0} of {msg.streamingProgress.target} {msg.streamingProgress.kind === 'words' ? 'words' : 'items'}...
+          </div>
+        )}
         {!isUser && completion?.complete === false && (
           <div className="chat-completion-warning" role="status">
             <strong>Incomplete response.</strong>

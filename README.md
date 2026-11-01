@@ -281,7 +281,11 @@ Three independent layers protect the answer from being short:
    rendered) asking for the missing items, then de-duplicates the seam with
    `mergeContinuation` — so nothing is repeated, numbering is preserved, and the
    user sees one seamless answer when the provider completes it. Bounded by
-   `LLM_MAX_CONTINUATIONS` (default 5, hard cap 6) and by a no-growth bail-out.
+   `LLM_MAX_CONTINUATIONS` (default 12, hard cap 20) and by a no-growth
+   bail-out. Long lists use bounded continuation turns sized to the provider's
+   output window, and each provider has a configurable admission queue so
+   concurrent users do not repeatedly collide with the same per-minute token
+   window.
    If the provider fails or repeats existing content, the saved assistant message
    records that it is incomplete and the chat offers a **Continue response**
    action; partial output is never silently represented as complete.

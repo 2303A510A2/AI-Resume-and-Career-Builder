@@ -40,7 +40,10 @@ const MAX_BUDGET_CAP = Number(process.env.LLM_MAX_OUTPUT_TOKENS || 32768);
 // Bounded auto-continuation. A provider can still hit its own output ceiling even
 // with a correct budget; rather than shipping a cut-off answer we ask for the
 // remainder and merge it. Bounded and internal — never shown to the user.
-const MAX_CONTINUATIONS = Math.max(0, Math.min(6, Number(process.env.LLM_MAX_CONTINUATIONS || 5)));
+// A 1,000-token Groq window can need 8-12 small turns for a 100-item list.
+// Keep the loop bounded, but do not make a valid large request impossible to
+// complete merely because one provider emits small chunks.
+const MAX_CONTINUATIONS = Math.max(0, Math.min(20, Number(process.env.LLM_MAX_CONTINUATIONS || 12)));
 const MAX_CONTINUATION_RATE_RETRIES = Math.max(0, Math.min(3, Number(process.env.LLM_CONTINUATION_RATE_RETRIES || 2)));
 const CONTINUATION_RATE_LIMIT_MAX_WAIT_MS = Math.max(
   0,
@@ -324,6 +327,7 @@ const askCareerAssistant = async ({
   requestId = '',
   preferences = {},
   onDelta,
+  onProgress,
   abortSignal,
 }) => {
   // ---- Requirement analysis FIRST (pure text, no I/O) -----------------------
@@ -682,6 +686,15 @@ ${buildDirective(req)}`;
   const structured = parseStructuredResponse(cleanRaw);
   let resources = structured ? structured.resources : [];
   let answer = structured ? structured.answer : cleanRaw;
+  if (typeof onProgress === 'function') {
+    const initialProgress = checkCompleteness(answer, req);
+    onProgress({
+      produced: initialProgress.produced,
+      target: initialProgress.target,
+      kind: initialProgress.kind,
+      complete: initialProgress.complete,
+    });
+  }
 
   // ---- Automatic continuation (never a visible message) --------------------
   // Three independent defences protect the user from a short answer:
@@ -691,7 +704,7 @@ ${buildDirective(req)}`;
   //      still short, ask the provider for the missing remainder.
   // The instruction is sent as an extra provider-only turn; it is NEVER persisted
   // to the chat and never rendered, so the user sees one seamless answer. It is
-  // bounded (LLM_MAX_CONTINUATIONS, hard cap 6) and every merge is
+  // bounded (LLM_MAX_CONTINUATIONS, hard cap 20) and every merge is
   // de-duplicated, so nothing is repeated and nothing loops forever.
   let completionState = { continuationAttempts: 0 };
   if (!providerCancelled && MAX_CONTINUATIONS > 0 && plan.needsContinuation) {
@@ -765,6 +778,15 @@ ${buildDirective(req)}`;
         break;
       }
       answer = merged;
+      if (typeof onProgress === 'function') {
+        const progress = checkCompleteness(answer, req);
+        onProgress({
+          produced: progress.produced,
+          target: progress.target,
+          kind: progress.kind,
+          complete: progress.complete,
+        });
+      }
     }
     const afterContinuations = checkCompleteness(answer, req);
     if (

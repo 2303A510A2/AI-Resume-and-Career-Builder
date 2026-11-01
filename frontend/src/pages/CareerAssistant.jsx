@@ -769,12 +769,21 @@ export default function CareerAssistant() {
             : m
         ));
       };
+      const updateProgress = (progress) => {
+        if (latestRequestIdRef.current !== rid) return;
+        setMessages((current) => current.map((m) =>
+          m.role === 'assistant' && m.streamingRequestId === rid
+            ? { ...m, streamingProgress: progress }
+            : m
+        ));
+      };
       setMessages((current) => [...current, { role: 'assistant', content: '', streamingRequestId: rid }]);
       try {
         data = await streamChatMessage(question, activeChatId, docIds, rid, {
           signal: streamAbort.signal,
           onDelta: appendLive,
           onReplace: replaceLive,
+          onProgress: updateProgress,
         });
       } catch (err) {
         if (err.response?.status !== 404 || !activeChatId) throw err;
@@ -783,6 +792,7 @@ export default function CareerAssistant() {
           signal: streamAbort.signal,
           onDelta: appendLive,
           onReplace: replaceLive,
+          onProgress: updateProgress,
         });
       }
       if (latestRequestIdRef.current !== rid) return; // a newer message superseded this one
@@ -795,6 +805,7 @@ export default function CareerAssistant() {
               sources: data.sources || [],
               completion: data.completion || data.message?.completion || undefined,
               image: data.message?.image || data.image || undefined,
+              streamingProgress: undefined,
             }
           : m
       ));
