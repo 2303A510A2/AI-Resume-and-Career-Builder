@@ -54,6 +54,17 @@ const completionSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const artifactSchema = new mongoose.Schema(
+  {
+    artifactId: { type: mongoose.Schema.Types.ObjectId, ref: 'Artifact', required: true },
+    title: { type: String, required: true },
+    extension: { type: String, required: true },
+    mimeType: { type: String, required: true },
+    fileSize: { type: Number, default: 0 },
+  },
+  { _id: false }
+);
+
 const messageSchema = new mongoose.Schema(
   {
     role: { type: String, enum: ['user', 'assistant'], required: true },
@@ -62,6 +73,7 @@ const messageSchema = new mongoose.Schema(
     sources: { type: [sourceSchema], default: undefined },
     image: { type: imageSchema, default: undefined },
     completion: { type: completionSchema, default: undefined },
+    artifacts: { type: [artifactSchema], default: undefined },
     requestId: { type: String, default: undefined },
   },
   { timestamps: true }

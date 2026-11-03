@@ -25,6 +25,9 @@ const { askCareerAssistant } = require('../services/ragService');
 const requestDedup = require('../services/requestDedup');
 const voiceService = require('../services/voiceService');
 const imageService = require('../services/imageService');
+const {
+  createArtifacts, toClient, formatsFromRequest, imagePromptsFromRequest, slideCountFromRequest,
+} = require('../services/artifactService');
 const { detectImageOperation } = require('../services/imageIntent');
 const llmService = require('../services/llmService');
 const {
@@ -85,7 +88,12 @@ const summarizeTitle = (message) => {
 const buildResponse = (result, chat) => ({
   success: true,
   conversationId: chat._id,
-  message: { role: 'assistant', content: result.answer, ...(result.completion ? { completion: result.completion } : {}) },
+  message: {
+    role: 'assistant',
+    content: result.answer,
+    ...(result.completion ? { completion: result.completion } : {}),
+    ...(result.artifacts && result.artifacts.length ? { artifacts: result.artifacts } : {}),
+  },
   resources: result.resources || [],
   sources: result.sources || [],
   completion: result.completion || null,
@@ -350,6 +358,22 @@ const handleCareerAssistant = async ({
     abortSignal,
   });
 
+  const requestedArtifactFormats = formatsFromRequest(message);
+  if (requestedArtifactFormats.length) {
+    const artifacts = await createArtifacts({
+      ownerId: userId,
+      title: String(message).slice(0, 200),
+      description: 'Generated from a career assistant request',
+      formats: requestedArtifactFormats,
+      content: { text: result.answer },
+      artifactType: 'assistant-export',
+      imagePrompts: imagePromptsFromRequest(message),
+      requestId: req.requestId || '',
+      slideCount: slideCountFromRequest(message),
+    });
+    result.artifacts = artifacts.map(toClient);
+  }
+
   // ---- Persist ----
   chat.messages.push({
     role: 'user',
@@ -364,6 +388,15 @@ const handleCareerAssistant = async ({
     ...(result.completion ? { completion: result.completion } : {}),
     ...(result.resources && result.resources.length ? { resources: result.resources } : {}),
     ...(result.sources && result.sources.length ? { sources: result.sources } : {}),
+    ...(result.artifacts && result.artifacts.length
+      ? { artifacts: result.artifacts.map((artifact) => ({
+        artifactId: artifact._id,
+        title: artifact.title,
+        extension: artifact.extension,
+        mimeType: artifact.mimeType,
+        fileSize: artifact.fileSize,
+      })) }
+      : {}),
   });
   await chat.save();
 

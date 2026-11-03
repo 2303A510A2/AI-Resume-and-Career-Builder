@@ -851,6 +851,20 @@ session version from the database record, never from the JWT claims.
 Sign in at `/admin` (or `/admin/login`). Admin APIs never expose passwords, OTP
 hashes, or chat message bodies — all queries are metadata-only.
 
+## Generated artifacts
+
+Authenticated users can generate genuine PDF, DOCX, PPTX, XLSX, and CSV files
+through `/api/artifacts` and download them only when they own the artifact.
+The chat endpoint also attaches generated file metadata when a request explicitly
+mentions one of those formats; the assistant UI provides authenticated download
+buttons. Files are stored privately under `backend/storage/artifacts` by default,
+or under `ARTIFACT_STORAGE_DIR`.
+
+Local disk is intentionally the development adapter. Render's ordinary filesystem
+is ephemeral across restarts and redeploys, so production deployments must provide
+a durable storage adapter before promising artifact persistence. `ARTIFACT_MAX_BYTES`
+defaults to 15 MiB per file.
+
 ## Testing & status
 
 See the top of this document for the feature list. The executable suites are:

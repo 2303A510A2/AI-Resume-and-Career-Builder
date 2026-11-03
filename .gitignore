@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+backend/storage/artifacts/
 
 # Build output
 frontend/dist/

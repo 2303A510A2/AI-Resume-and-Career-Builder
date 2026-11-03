@@ -910,6 +910,13 @@ const mergeContinuation = (existing, extra, options = {}) => {
     const expectedFrom = Number(options.from) || (lastNum + 1);
     const expectedTo = Number(options.to) || 0;
 
+    // A provider can repeat the same numbered batch instead of supplying a
+    // remainder. Detect exact re-emission before local numbering is shifted.
+    const existingLineSet = new Set(head.split('\n').map((line) => line.trim()).filter(Boolean));
+    if (lines.length && lines.every((line) => !line.trim() || existingLineSet.has(line.trim()))) {
+      return head;
+    }
+
     // Providers sometimes obey the "continue" instruction semantically but
     // number the isolated batch from 1. Convert that local sequence into the
     // global sequence before merging. Only do this when every marker is below

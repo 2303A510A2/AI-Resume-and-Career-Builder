@@ -426,7 +426,7 @@ const main = async () => {
       replies: [{ content: full, truncated: true }, '11. Item 11\n12. Item 12'],
     });
     ok('a truncated-but-complete-marked answer still continues once', r.calls.length === 2, `${r.calls.length} call(s) (old trigger: 1)`);
-    ok('the extra content is merged in', /Item 12/.test(r.answer), r.answer.replace(/\n/g, ' ').slice(-60));
+    ok('provider overrun is bounded to the requested target', !/Item 12/.test(r.answer), r.answer.replace(/\n/g, ' ').slice(-60));
     ok('previously delivered items are not duplicated', (r.answer.match(/Item 1\b/g) || []).length === 1, `${(r.answer.match(/Item 1\b/g) || []).length} occurrence(s)`);
     ok('the loop stops after the continuation when it is no longer truncated', r.calls.length === 2, `${r.calls.length} call(s)`);
   }

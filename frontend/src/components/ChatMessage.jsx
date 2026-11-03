@@ -7,6 +7,7 @@ import { assistantSpeech, speechSynthesisSupported } from '../services/voiceServ
 import { fetchDocumentImage } from '../services/fileService';
 import { fetchGeneratedImage } from '../services/chatService';
 import { highlightTokens } from '../services/syntaxHighlight';
+import { downloadArtifact } from '../services/artifactService';
 
 /* ------------------------------------------------------------------ *
  * Minimal, safe markdown-ish renderer for AI chat bubbles. Everything  *
@@ -129,6 +130,35 @@ const splitRow = (line) =>
 function SourceRow({ line }) {
   const text = line.replace(/^>\s?/, '');
   return <div className="bot-quote-line">{renderInline(text)}</div>;
+}
+
+function ArtifactCards({ artifacts }) {
+  const [downloading, setDownloading] = useState('');
+  const [error, setError] = useState('');
+  return (
+    <div className="resource-list" aria-label="Generated files">
+      {artifacts.map((artifact, index) => (
+        <button
+          type="button"
+          className="resource-card"
+          key={artifact.artifactId || index}
+          disabled={downloading === (artifact.artifactId || index)}
+          onClick={async () => {
+            const key = artifact.artifactId || index;
+            setDownloading(key);
+            setError('');
+            try { await downloadArtifact(artifact); } catch (downloadError) { setError(downloadError.message); }
+            finally { setDownloading(''); }
+          }}
+        >
+          {downloading === (artifact.artifactId || index) ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
+          <span>{artifact.title || 'Generated file'}</span>
+          <small>.{artifact.extension}</small>
+        </button>
+      ))}
+      {error && <small className="warn-text">{error}</small>}
+    </div>
+  );
 }
 
 function TextBlock({ text }) {
@@ -929,6 +959,9 @@ export default function ChatMessage({ msg, onRetry, onRegenerate, onRegenerateIm
           </div>
         )}
         {sources.length > 0 && !isUser && <SourcesSection sources={sources} />}
+        {!isUser && Array.isArray(msg?.artifacts) && msg.artifacts.length > 0 && (
+          <ArtifactCards artifacts={msg.artifacts} />
+        )}
         {!isUser && (
           <AiActions
             plainText={messageToPlainText(msg)}

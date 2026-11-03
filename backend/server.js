@@ -34,6 +34,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const fileRoutes = require('./routes/fileRoutes');
 const aiRoutes = require('./routes/aiRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
+const artifactRoutes = require('./routes/artifactRoutes');
 
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 const { validateAuthConfig } = require('./utils/authConfig');
@@ -238,6 +239,7 @@ app.use('/api/interview', interviewRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/files', fileRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/artifacts', artifactRoutes);
 
 // ---- Development-only request logging for the AI pipeline ----
 //
