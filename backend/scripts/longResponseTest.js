@@ -8,6 +8,7 @@ const assert = require('assert');
 const llmService = require('../services/llmService');
 const ragService = require('../services/ragService');
 const { tryDeterministic } = require('../services/deterministicService');
+const { mergeContinuation } = require('../services/outputRequirements');
 
 let passed = 0;
 const ok = (name, condition, detail = '') => {
@@ -69,6 +70,23 @@ const main = async () => {
   ok('100 LeetCode problems are complete', problems.completion.complete === true);
   ok('100 LeetCode problems contain all requested markers', problems.completion.produced === 100);
   ok('100 LeetCode problems do not duplicate markers', (problems.completion.duplicates || []).length === 0);
+
+  const restartedBatch = await run({
+    question: 'Give me 50 LeetCode problems to solve.',
+    reply: (call) => call === 1
+      ? numbered(1, 29, 'LeetCode problem')
+      : numbered(1, 21, 'A different LeetCode problem'),
+  });
+  ok('a restarted second batch is normalized to the global sequence', restartedBatch.completion.complete === true);
+  ok('29 + restarted 1..21 produces exactly items 1..50', restartedBatch.completion.produced === 50);
+  ok('normalized batches contain no duplicate markers', (restartedBatch.completion.duplicates || []).length === 0);
+
+  const bounded = mergeContinuation(
+    numbered(1, 29, 'existing'),
+    numbered(1, 30, 'new'),
+    { from: 30, to: 50 }
+  );
+  ok('a continuation batch is bounded at the requested final item', !/^51\./m.test(bounded));
 
   const article = await run({
     question: 'Write an article of 1000 words about learning Java.',

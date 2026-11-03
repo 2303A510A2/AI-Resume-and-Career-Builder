@@ -435,6 +435,8 @@ const continueCareerAssistant = async (req, res) => {
         userId,
         userName: (req.userRecord && req.userRecord.name) || '',
         question,
+        requirementQuestion: originalQuestion,
+        continuationAnswer: assistant.content,
         history,
         requestId: rid,
         preferences: (req.userRecord && req.userRecord.settings && req.userRecord.settings.chat) || {},

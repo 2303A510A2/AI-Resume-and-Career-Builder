@@ -15,6 +15,8 @@ const {
   checkCompleteness,
   buildContinuationPrompt,
   mergeContinuation,
+  numberedRuns,
+  bulletCount,
 } = require('./outputRequirements');
 
 // ---------------------------------------------------------------------------
@@ -321,6 +323,8 @@ const continuationBudget = (req, check, cap) => {
 const askCareerAssistant = async ({
   userId,
   question,
+  requirementQuestion = '',
+  continuationAnswer = '',
   history = [],
   extraDocuments = null,
   attachedImages = [],
@@ -335,7 +339,25 @@ const askCareerAssistant = async ({
   // Everything downstream depends on it: whether retrieval is even relevant, how
   // big the output budget is, what the directive says, and whether the finished
   // answer is actually complete.
-  const req = analyzeRequest({ question, history });
+  let req = analyzeRequest({ question: requirementQuestion || question, history, previousAnswer: continuationAnswer });
+  if (continuationAnswer && requirementQuestion) {
+    const previousNumbers = numberedRuns(continuationAnswer);
+    const previousCount = previousNumbers.size
+      ? Math.max(...previousNumbers)
+      : bulletCount(continuationAnswer);
+    const target = req.range ? req.range.to : req.itemCount;
+    if (target && previousCount < target) {
+      req = {
+        ...req,
+        itemCount: target - previousCount,
+        continueFrom: previousCount + 1,
+        targetTotal: target,
+        isContinuation: true,
+        previousItemCount: previousCount,
+        missingCount: target - previousCount,
+      };
+    }
+  }
 
   // Exact arithmetic/table requests do not need a provider. This is deliberately
   // conservative: only explicit multiplication-table wording is handled here;
@@ -788,7 +810,10 @@ ${buildDirective(req)}`;
         );
         break;
       }
-      const merged = mergeContinuation(answer, extra);
+      const merged = mergeContinuation(answer, extra, {
+        from: check.nextIndex,
+        to: check.target,
+      });
       // No growth means the provider only repeated what we already had — stop.
       if (merged.length <= answer.length + 20) {
         continuationStopped = 'no_progress';

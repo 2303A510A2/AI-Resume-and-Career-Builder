@@ -887,7 +887,7 @@ const buildContinuationPrompt = ({ req = {}, check = {}, producedText = '', ques
  *      the end of the first answer (a re-printed header, a repeated preamble)
  *      are dropped.
  */
-const mergeContinuation = (existing, extra) => {
+const mergeContinuation = (existing, extra, options = {}) => {
   let add = String(extra || '').replace(/\s+$/, '');
   const head = String(existing || '').replace(/\s+$/, '');
   if (!add) return head;
@@ -904,9 +904,46 @@ const mergeContinuation = (existing, extra) => {
   const existingNums = numberedRuns(head);
   const lastNum = existingNums.size ? Math.max(...existingNums) : 0;
   if (lastNum > 0) {
-    const lines = add.split('\n');
+    let lines = add.split('\n');
     const addNums = numberedRuns(add);
-    const restarted = addNums.size > 0 && Math.min(...addNums) <= lastNum;
+    const addValues = [...addNums];
+    const expectedFrom = Number(options.from) || (lastNum + 1);
+    const expectedTo = Number(options.to) || 0;
+
+    // Providers sometimes obey the "continue" instruction semantically but
+    // number the isolated batch from 1. Convert that local sequence into the
+    // global sequence before merging. Only do this when every marker is below
+    // the expected global start; a mixed batch is handled by the restart logic
+    // below so valid global items are retained.
+    if (
+      addValues.length &&
+      expectedFrom > 1 &&
+      Math.min(...addValues) === 1 &&
+      Math.max(...addValues) < expectedFrom
+    ) {
+      const shift = expectedFrom - 1;
+      const marker = /^([ \t]*(?:[-*+][ \t]+)?[#* \t]*(?:table|step|question|problem|example|no\.?)[ \t]+|[ \t]*(?:[-*+][ \t]+)?\**[ \t]*)(\d{1,4})(?=[.) :])/i;
+      add = lines.map((line) => line.replace(marker, (full, prefix, number) => (
+        `${prefix}${Number(number) + shift}`
+      ))).join('\n');
+      lines = add.split('\n');
+    }
+
+    // Do not append a provider's overrun after the requested final item.
+    // Item content belongs to the marker line until the next marker, so
+    // dropping from the first out-of-range marker preserves complete items.
+    if (expectedTo > 0) {
+      const boundedLines = add.split('\n');
+      const firstOutOfRange = boundedLines.findIndex((line) => {
+        const n = itemNumber(line);
+        return n !== null && n > expectedTo;
+      });
+      if (firstOutOfRange >= 0) add = boundedLines.slice(0, firstOutOfRange).join('\n').replace(/\s+$/, '');
+      lines = add.split('\n');
+    }
+
+    const normalizedNums = numberedRuns(add);
+    const restarted = normalizedNums.size > 0 && Math.min(...normalizedNums) <= lastNum;
 
     if (restarted) {
       // The model restarted from 1: drop everything up to and including the
