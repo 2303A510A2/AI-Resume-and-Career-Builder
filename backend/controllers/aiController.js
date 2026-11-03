@@ -27,6 +27,11 @@ const voiceService = require('../services/voiceService');
 const imageService = require('../services/imageService');
 const { detectImageOperation } = require('../services/imageIntent');
 const llmService = require('../services/llmService');
+const {
+  analyzeRequest,
+  checkCompleteness,
+  mergeContinuation,
+} = require('../services/outputRequirements');
 
 // Safe development diagnostics (§12) — OFF in production, opt-out with
 // PROVIDER_LOG=0. Prints provider, model, a safe user id and the requestId:
@@ -349,11 +354,13 @@ const handleCareerAssistant = async ({
   chat.messages.push({
     role: 'user',
     content: String(message),
+    requestId: req.requestId || undefined,
     ...(validIds.length ? { documentIds: validIds } : {}),
   });
   chat.messages.push({
     role: 'assistant',
     content: result.answer,
+    requestId: req.requestId || undefined,
     ...(result.completion ? { completion: result.completion } : {}),
     ...(result.resources && result.resources.length ? { resources: result.resources } : {}),
     ...(result.sources && result.sources.length ? { sources: result.sources } : {}),
@@ -361,6 +368,111 @@ const handleCareerAssistant = async ({
   await chat.save();
 
   return buildResponse(result, chat);
+};
+
+const continuationQuestion = (completion) => {
+  if (completion && completion.kind === 'items' && completion.nextIndex && completion.target) {
+    return `Continue the previous response with items ${completion.nextIndex} through ${completion.target}. ` +
+      'Return only the missing items, keep the numbering and format continuous, and do not repeat earlier items.';
+  }
+  if (completion && completion.kind === 'words' && completion.requested && typeof completion.produced === 'number') {
+    return `Continue the previous response with approximately ${Math.max(50, completion.requested - completion.produced)} new words. ` +
+      'Continue from exactly where it stopped without repeating earlier content.';
+  }
+  return 'Continue the previous response from exactly where it stopped. Add only missing content without repeating anything.';
+};
+
+// @desc   Resume the latest persisted incomplete answer without adding a visible
+//         user turn. The prior answer is merged into the same message.
+// @route  POST /api/ai/career-assistant/continue (protected)
+const continueCareerAssistant = async (req, res) => {
+  const { conversationId, requestId } = req.body || {};
+  if (!conversationId || !mongoose.isValidObjectId(String(conversationId))) {
+    return res.status(400).json({ success: false, code: 'INVALID_CONVERSATION', message: 'A valid conversationId is required' });
+  }
+
+  const userId = req.user.id;
+  const rid = String(requestId || '').trim() || crypto.randomUUID();
+  req.requestId = rid;
+
+  const { deduped, payload } = await requestDedup.runOnce(`continue:${userId}:${rid}`, async () => {
+    const chat = await Chat.findOne({ _id: conversationId, userId });
+    if (!chat) {
+      const error = new Error('Conversation not found');
+      error.statusCode = 404;
+      error.code = 'CONVERSATION_NOT_FOUND';
+      error.isOperational = true;
+      throw error;
+    }
+
+    const messages = chat.messages || [];
+    const assistantIndex = messages.length - 1;
+    const assistant = messages[assistantIndex];
+    const userMessage = messages[assistantIndex - 1];
+    if (
+      !assistant ||
+      assistant.role !== 'assistant' ||
+      !assistant.completion ||
+      assistant.completion.complete !== false ||
+      !userMessage ||
+      userMessage.role !== 'user'
+    ) {
+      const error = new Error('There is no incomplete response to continue.');
+      error.statusCode = 409;
+      error.code = 'NO_INCOMPLETE_RESPONSE';
+      error.isOperational = true;
+      throw error;
+    }
+
+    const originalQuestion = String(userMessage.content || '');
+    const question = continuationQuestion(assistant.completion);
+    const history = messages
+      .slice(0, assistantIndex)
+      .map((m) => ({ role: m.role === 'assistant' ? 'ai' : 'user', content: m.content }));
+    let result;
+    try {
+      result = await askCareerAssistant({
+        userId,
+        userName: (req.userRecord && req.userRecord.name) || '',
+        question,
+        history,
+        requestId: rid,
+        preferences: (req.userRecord && req.userRecord.settings && req.userRecord.settings.chat) || {},
+      });
+    } catch (error) {
+      assistant.completion.failure = String(error.code || 'AI_PROVIDER_ERROR');
+      assistant.completion.stopped = 'continue_failed';
+      await chat.save();
+      throw error;
+    }
+
+    const mergedAnswer = mergeContinuation(String(assistant.content || ''), result.answer);
+    const originalReq = analyzeRequest({ question: originalQuestion, history });
+    const check = checkCompleteness(mergedAnswer, originalReq);
+    const completion = {
+      ...(assistant.completion.toObject ? assistant.completion.toObject() : assistant.completion),
+      complete: check.complete,
+      kind: check.kind,
+      requested: originalReq.itemCount || originalReq.wordCount || assistant.completion.requested || null,
+      produced: check.produced,
+      nextIndex: check.nextIndex,
+      target: check.target,
+      reason: check.reason,
+      continuationAttempts: (assistant.completion.continuationAttempts || 0) + 1,
+      providerTruncated: Boolean(result.completion && result.completion.providerTruncated),
+      failure: result.completion && result.completion.failure ? result.completion.failure : '',
+      stopped: result.completion && result.completion.stopped ? result.completion.stopped : '',
+    };
+
+    assistant.content = mergedAnswer;
+    assistant.completion = completion;
+    assistant.requestId = rid;
+    await chat.save();
+
+    return buildResponse({ ...result, answer: mergedAnswer, completion }, chat);
+  });
+
+  return res.json({ ...payload, requestId: rid, deduped: Boolean(deduped) });
 };
 
 // @desc   Chat with the real AI career assistant (RAG + LLM + image generation)
@@ -705,6 +817,7 @@ const speech = async (req, res) => {
 module.exports = {
   careerAssistant,
   careerAssistantStream,
+  continueCareerAssistant,
   regenerateMessage,
   generateImage,
   getGeneratedImage,

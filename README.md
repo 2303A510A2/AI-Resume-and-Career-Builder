@@ -288,7 +288,10 @@ Three independent layers protect the answer from being short:
    window.
    If the provider fails or repeats existing content, the saved assistant message
    records that it is incomplete and the chat offers a **Continue response**
-   action; partial output is never silently represented as complete.
+   action; partial output is never silently represented as complete. Continue
+   resumes the persisted incomplete assistant message in place, merges only the
+   missing content, and is deduplicated by `requestId`, so repeated clicks
+   cannot create duplicate user turns or regenerate completed items.
 
 Timeouts scale with the budget instead of a flat 20 s, so a legitimately large
 answer is never killed as "AI unreachable" — see `LLM_LONG_TIMEOUT_MS`,
@@ -401,6 +404,10 @@ REST API — no simulated AI replies anywhere. Real end-to-end chat flow:
 - `POST /api/ai/career-assistant/regenerate` — re-runs the last user question
   through the same RAG pipeline and **replaces** the previous answer (ChatGPT
   "regenerate" behavior); history stays consistent on success or failure.
+- `POST /api/ai/career-assistant/continue` — resumes the latest incomplete
+  assistant answer in an owned conversation, merges the missing content into
+  the existing message, and returns the updated completion metadata. It does
+  not append a visible user message.
 - `POST /api/ai/transcribe` — voice input fallback: multipart `audio` → Groq
   `whisper-large-v3-turbo` → `{ transcript }`. The primary input path is the
   browser Web Speech API (see [Voice input](#voice-input)); this endpoint is used

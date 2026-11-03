@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Send, Trash2, Plus, MessageSquare, Loader2, Sparkles, UploadCloud, Briefcase, Paperclip, X, Mic, Square, Search, ChevronDown, Menu } from 'lucide-react';
-import { streamChatMessage, sendChatMessage, listChats, getChat, deleteChat, regenerateMessage, newRequestId, looksLikeImageRequest, searchChats } from '../services/chatService';
+import { streamChatMessage, sendChatMessage, listChats, getChat, deleteChat, regenerateMessage, continueChatResponse, newRequestId, looksLikeImageRequest, searchChats } from '../services/chatService';
 import { getAuthToken, inspectToken, clearToken } from '../services/authService';
 import { uploadChatFiles, classifyFileName, ACCEPTED_FILE_TYPES } from '../services/fileService';
 import { getResume, getJob } from '../services/resumeService';
@@ -864,15 +864,44 @@ export default function CareerAssistant() {
   };
 
   const handleContinue = async (completion) => {
-    if (sendingRef.current || regeneratingRef.current) return;
-    let question = 'Continue the previous response from where it stopped. Add only missing content and do not repeat earlier content.';
-    if (completion?.kind === 'items' && completion.nextIndex && completion.target) {
-      question = `Continue the previous list: include items ${completion.nextIndex} through ${completion.target}. Fill only missing items, keep numbering continuous, and do not repeat any item already present.`;
-    } else if (completion?.kind === 'words' && completion.requested && typeof completion.produced === 'number') {
-      question = `Continue the previous answer with about ${Math.max(50, completion.requested - completion.produced)} additional words. Continue from where it stopped without repeating earlier content.`;
+    if (sendingRef.current || regeneratingRef.current || !activeChatId) return;
+    sendingRef.current = true;
+    setSending(true);
+    const rid = newRequestId();
+    latestRequestIdRef.current = rid;
+    try {
+      const { data } = await continueChatResponse(activeChatId, rid);
+      if (latestRequestIdRef.current !== rid) return;
+      setMessages((current) => {
+        const out = [...current];
+        for (let i = out.length - 1; i >= 0; i -= 1) {
+          if (out[i].role === 'assistant') {
+            out[i] = {
+              ...out[i],
+              content: data.message?.content || out[i].content,
+              completion: data.completion || data.message?.completion || completion,
+              resources: data.resources || out[i].resources || [],
+              sources: data.sources || out[i].sources || [],
+            };
+            break;
+          }
+        }
+        return out;
+      });
+      failedQuestionRef.current = null;
+      loadChats();
+    } catch (err) {
+      if (latestRequestIdRef.current !== rid) return;
+      const fb = await friendlyError(err);
+      setMessages((m) => [...m, {
+        role: 'error',
+        content: fb.text,
+        retryable: fb.retryable !== false,
+      }]);
+    } finally {
+      sendingRef.current = false;
+      setSending(false);
     }
-    setMessages((current) => [...current, { role: 'user', content: question }]);
-    await submitQuestion(question);
   };
 
   // Retry re-runs the exact failed question WITHOUT duplicating the user bubble

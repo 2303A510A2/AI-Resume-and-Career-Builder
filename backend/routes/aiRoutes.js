@@ -4,6 +4,7 @@ const { enforceAiLimits } = require('../middleware/aiUsageMiddleware');
 const {
   careerAssistant,
   careerAssistantStream,
+  continueCareerAssistant,
   regenerateMessage,
   generateImage,
   getGeneratedImage,
@@ -19,6 +20,7 @@ const router = express.Router();
 // inside this same endpoint, so the user never picks a mode.
 router.post('/career-assistant', protect, enforceAiLimits, careerAssistant);
 router.post('/career-assistant/stream', protect, enforceAiLimits, careerAssistantStream);
+router.post('/career-assistant/continue', protect, enforceAiLimits, continueCareerAssistant);
 // Regenerate: re-run the last user question and replace the previous answer
 // (for a generated image: generate a brand-new image from the same prompt).
 router.post('/career-assistant/regenerate', protect, enforceAiLimits, regenerateMessage);

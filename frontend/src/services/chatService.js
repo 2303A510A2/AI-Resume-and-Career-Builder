@@ -95,6 +95,11 @@ export const streamChatMessage = async (
 export const regenerateMessage = (conversationId, requestId) =>
   api.post('/ai/career-assistant/regenerate', { conversationId, requestId });
 
+// Resume the latest persisted incomplete answer in-place. Unlike a normal chat
+// send this does not add a visible user turn or duplicate the saved content.
+export const continueChatResponse = (conversationId, requestId) =>
+  api.post('/ai/career-assistant/continue', { conversationId, requestId });
+
 // Conversation history. Paginated server-side (newest activity first): the
 // sidebar loads the first page, then "See more" appends the next pages without
 // ever re-downloading everything.
