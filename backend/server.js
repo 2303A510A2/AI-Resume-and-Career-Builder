@@ -443,7 +443,11 @@ function startListening(app, port) {
 
   const bind = () => {
     attempt += 1;
-    const server = app.listen(port, '0.0.0.0');
+    // Leave the host unspecified so Node uses the same all-interface socket
+    // semantics as the conflict probe and the default Express listener. An
+    // explicit IPv4 bind can coexist with an IPv6 wildcard holder on Windows,
+    // defeating the retry path and allowing duplicate backends to start.
+    const server = app.listen(port);
 
     server.on('listening', () => {
       if (attempt > 1) {

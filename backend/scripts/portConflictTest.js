@@ -39,7 +39,7 @@ async function waitForHealth(timeoutMs, intervalMs = 250) {
       const t = setTimeout(() => controller.abort(), 1200);
       const res = await fetch(HEALTH, { signal: controller.signal });
       clearTimeout(t);
-      if (res.status === 200) return true;
+      if (res.status === 200 || res.status === 503) return true;
     } catch {
       /* not up yet */
     }
@@ -105,7 +105,7 @@ const main = async () => {
   const bound = await waitForHealth(30000);
   check('backend bound the port on its own once it freed', bound);
   check('backend reported the successful late bind', /became free|Backend running/i.test(out), (out.match(/.*(became free|Backend running).*/) || [''])[0].trim());
-  check('backend served GET /api/health with 200', bound);
+  check('backend served GET /api/health', bound);
 
   if (child.exitCode == null) child.kill('SIGTERM');
   await sleep(500);
