@@ -971,6 +971,27 @@ const mergeContinuation = (existing, extra, options = {}) => {
       return head;
     }
 
+    // A provider can mix a correctly numbered first item with a locally
+    // restarted batch ("6. Majority" followed by "1. Two Sum"). Treat the
+    // continuation as one append-only batch and renumber every item marker
+    // from the expected global index before merging.
+    if (
+      expectedFrom > 1 &&
+      addValues.length > 1 &&
+      addValues.some((n, i) => i > 0 && n <= addValues[i - 1])
+    ) {
+      let nextNumber = expectedFrom;
+      add = lines.map((line) => {
+        if (itemNumber(line) === null) return line;
+        const replaced = line.replace(
+          /^([ \t]*(?:[-*+][ \t]+)?(?:\**[ \t]*#*[ \t]*)?(?:table|step|question|problem|example|no\.?[ \t]+)?\**[ \t]*)(\d{1,4})(?=[.) :])/i,
+          (full, prefix) => `${prefix}${nextNumber++}`
+        );
+        return replaced;
+      }).join('\n');
+      lines = add.split('\n');
+    }
+
     // Providers sometimes obey the "continue" instruction semantically but
     // number the isolated batch from 1. Convert that local sequence into the
     // global sequence before merging. Only do this when every marker is below

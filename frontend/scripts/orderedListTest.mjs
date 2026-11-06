@@ -14,7 +14,7 @@ const check = (name, value) => {
 check('dot marker', parseListMarker('1. first')?.number === 1);
 check('bold marker', parseListMarker('**2.** second')?.number === 2);
 check('colon marker', parseListMarker('3: third')?.number === 3);
-check('table heading marker', parseListMarker('### Table 4')?.number === 4);
+check('markdown heading is not a list marker', parseListMarker('### Table 4') === null);
 check('unordered marker', parseListMarker('- item')?.type === 'ul');
 
 const lines = ['1. first', '', '2. second', '', '3. third'];

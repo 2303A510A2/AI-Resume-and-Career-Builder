@@ -10,10 +10,6 @@ export function parseListMarker(line) {
   if (match) {
     return { type: 'ol', indent: match[1].length, number: Number(match[2]), text: match[3] };
   }
-  match = value.match(/^(\s*)[#*\s]*(?:table|step|question|problem|example|no\.?)\s+(\d{1,4})\b:?\s*(.*)$/i);
-  if (match) {
-    return { type: 'ol', indent: match[1].length, number: Number(match[2]), text: match[3] || `${match[0].trim()}` };
-  }
   match = value.match(/^(\s*)([-*•])\s+(.*)$/);
   if (match) return { type: 'ul', indent: match[1].length, text: match[3] };
   return null;

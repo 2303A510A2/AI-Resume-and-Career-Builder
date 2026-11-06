@@ -48,5 +48,14 @@ for (const [question, count] of requests) {
   check('a restarted continuation is renumbered and complete', result.complete, result.reason);
 }
 
+{
+  const req = analyzeRequest({ question: 'Give me 10 LeetCode problems' });
+  const partial = Array.from({ length: 5 }, (_, i) => `${i + 1}. Problem ${i + 1}`).join('\n');
+  const mixed = '6. Majority Element\n1. Problem 7\n2. Problem 8\n3. Problem 9\n4. Problem 10';
+  const merged = mergeContinuation(partial, mixed, { from: 6, to: 10 });
+  const result = checkCompleteness(merged, req);
+  check('a mixed global/local continuation stays continuous', result.complete, result.reason);
+}
+
 console.log(`\nexactQuantityTest: ${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

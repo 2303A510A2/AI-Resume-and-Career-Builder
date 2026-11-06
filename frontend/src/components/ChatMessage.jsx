@@ -9,6 +9,7 @@ import { fetchGeneratedImage } from '../services/chatService';
 import { highlightTokens } from '../services/syntaxHighlight';
 import { downloadArtifact } from '../services/artifactService';
 import { parseListMarker, shouldKeepListAcrossBlank } from '../services/markdownList';
+import { visibleResources } from '../services/resourceDisplay';
 
 /* ------------------------------------------------------------------ *
  * Minimal, safe markdown-ish renderer for AI chat bubbles. Everything  *
@@ -882,7 +883,7 @@ export default function ChatMessage({ msg, onRetry, onRegenerate, onRegenerateIm
     );
   }
 
-  const resources = Array.isArray(msg?.resources) ? msg.resources : [];
+  const resources = visibleResources(msg?.resources, msg?.content);
   const sources = Array.isArray(msg?.sources) ? msg.sources : [];
   const completion = msg?.completion;
   const completionIssue = completion?.failure === 'AI_DAILY_LIMIT'
