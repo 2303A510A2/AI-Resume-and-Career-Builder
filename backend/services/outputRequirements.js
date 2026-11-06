@@ -91,7 +91,13 @@ const ADJECTIVE_STOP = new Set([
 const NON_RANGE_UNIT_RE =
   /^[\s-]*(?:words?|w\b|marks?|%|percent|years?|yrs?|months?|days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|rs\.?|inr|usd|dollars?|eur|kg|mg|mb|gb|kb|tb|credits?|likes?|views?|stars?)\b/i;
 
-const MAX_QUANTITY = 300;     // never budget for more than this many items
+// Keep a safety ceiling for malformed prompts, but do not impose a product
+// limit such as 10, 20, or 100 items. Explicit user quantities are preserved
+// up to the parser's four-digit range.
+const configuredMaxQuantity = Number(process.env.LLM_MAX_REQUEST_ITEMS);
+const MAX_QUANTITY = Number.isFinite(configuredMaxQuantity) && configuredMaxQuantity >= 1
+  ? Math.floor(configuredMaxQuantity)
+  : 9999;
 const MAX_WORDS = 20000;      // never budget for more than this many words
 
 // ---------------------------------------------------------------------------
@@ -337,6 +343,32 @@ const numberedProgress = (text) => {
     }
   }
   return { numbers: unique, duplicates, missing };
+};
+
+const numberedEntries = (text) => {
+  const entries = [];
+  const t = String(text || '');
+  const marker =
+    /^[ \t]*(?:[-*+][ \t]+)?\**[ \t]*(\d{1,4})[ \t]*(?:[.)]\**|:\**)[ \t]+(.*)$/gm;
+  let m;
+  while ((m = marker.exec(t)) !== null) {
+    const content = String(m[2] || '')
+      .replace(/[`*_>#]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    if (content) entries.push({ number: Number(m[1]), content });
+  }
+  const heading = /(?:^|\n)[ \t#*]*(?:table|step|question|problem|example|no\.?)[ \t]+(\d{1,4})\b[ :]*(.*)$/gim;
+  while ((m = heading.exec(t)) !== null) {
+    const content = String(m[2] || `item ${m[1]}`)
+      .replace(/[`*_>#]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+    if (content) entries.push({ number: Number(m[1]), content });
+  }
+  return entries;
 };
 
 /** Non-empty bullet/dash lines — used when a list is not numbered. */
@@ -738,6 +770,15 @@ const checkCompleteness = (text, req = {}) => {
     const to = req.targetTotal ? req.targetTotal : from + req.itemCount - 1;
     const nums = numberedRuns(body);
     const progress = numberedProgress(body);
+    const entries = numberedEntries(body);
+    const contentCounts = new Map();
+    for (const entry of entries) {
+      contentCounts.set(entry.content, (contentCounts.get(entry.content) || 0) + 1);
+    }
+    const duplicateItems = [...contentCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([content]) => content)
+      .slice(0, 10);
     let produced = 0;
     let missingFrom = null;
     for (let i = from; i <= to; i += 1) {
@@ -769,7 +810,12 @@ const checkCompleteness = (text, req = {}) => {
     // per table but no digits) falls back to counting list lines.
     const useBullets = produced === 0 && body.length > 40;
     const effective = useBullets ? bulletCount(body) : produced;
-    if (effective < req.itemCount || progress.duplicates.length || progress.missing.length) {
+    if (
+      effective < req.itemCount ||
+      progress.duplicates.length ||
+      progress.missing.length ||
+      duplicateItems.length
+    ) {
       const next = missingFrom !== null
         ? missingFrom
         : (progress.missing[0] || null);
@@ -780,8 +826,11 @@ const checkCompleteness = (text, req = {}) => {
         words,
         target: to,
         duplicates: progress.duplicates,
+        duplicateItems,
         missing: progress.missing,
-        reason: progress.duplicates.length
+        reason: duplicateItems.length
+          ? `duplicate item content: ${duplicateItems.join(', ')}`
+          : progress.duplicates.length
           ? `duplicate item marker(s): ${progress.duplicates.join(', ')}`
           : useBullets
           ? `${effective}/${req.itemCount} items found`
@@ -821,6 +870,7 @@ const checkCompleteness = (text, req = {}) => {
       words,
       target: to,
       duplicates: progress.duplicates,
+      duplicateItems,
       missing: progress.missing,
       reason: `items ${from}..${to} all present`,
       kind: 'items',
@@ -862,7 +912,11 @@ const buildContinuationPrompt = ({ req = {}, check = {}, producedText = '', ques
       'Rules for this continuation: start immediately with the next item; use the SAME numbering and the SAME format as before; do NOT restart at 1; do NOT repeat, re-list, or summarise earlier items; do NOT write any introduction, conclusion, "let me know" or follow-up question; never use "..." or "and so on" in place of the missing items.'
     );
   } else {
-    if (check.duplicates && check.duplicates.length) {
+    if (check.duplicateItems && check.duplicateItems.length) {
+      lines.push(
+        `Your previous reply repeated item content (${check.duplicateItems.join('; ')}). Supply corrected, genuinely distinct items only; do NOT repeat any item already present and do NOT restart at 1.`
+      );
+    } else if (check.duplicates && check.duplicates.length) {
       lines.push(
         `Your previous reply repeated item marker(s) ${check.duplicates.join(', ')}. Continue by supplying only the missing or corrected item content; do NOT repeat any item already present and do NOT restart at 1.`
       );

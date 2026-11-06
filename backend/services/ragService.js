@@ -865,6 +865,7 @@ ${buildDirective(req)}`;
         nextIndex: finalCheck.nextIndex,
         target: finalCheck.target,
         ...(finalCheck.duplicates?.length ? { duplicates: finalCheck.duplicates } : {}),
+        ...(finalCheck.duplicateItems?.length ? { duplicateItems: finalCheck.duplicateItems } : {}),
         ...(finalCheck.missing?.length ? { missing: finalCheck.missing } : {}),
         finishReason: providerFinishReason,
         providerTruncated,

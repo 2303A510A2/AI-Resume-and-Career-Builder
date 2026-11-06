@@ -8,6 +8,7 @@ import { fetchDocumentImage } from '../services/fileService';
 import { fetchGeneratedImage } from '../services/chatService';
 import { highlightTokens } from '../services/syntaxHighlight';
 import { downloadArtifact } from '../services/artifactService';
+import { parseListMarker, shouldKeepListAcrossBlank } from '../services/markdownList';
 
 /* ------------------------------------------------------------------ *
  * Minimal, safe markdown-ish renderer for AI chat bubbles. Everything  *
@@ -102,16 +103,6 @@ function splitBlocks(text) {
   if (!blocks.length && text) blocks.push({ type: 'text', text });
   return blocks;
 }
-
-const isOrderedItem = (line) => {
-  const m = line.match(/^(\s*)\d+[.)]\s+(.*)$/);
-  return m ? { indent: m[1].length, text: m[2] } : null;
-};
-
-const isUnorderedItem = (line) => {
-  const m = line.match(/^(\s*)([-*•])\s+(.*)$/);
-  return m ? { indent: m[1].length, text: m[3] } : null;
-};
 
 // A table row may or may not carry a trailing pipe — models are inconsistent, and
 // a "trailing pipe missing" row must still render as a table row, not as body text.
@@ -224,9 +215,15 @@ function TextBlock({ text }) {
     table = null;
   };
 
-  lines.forEach((rawLine) => {
+  lines.forEach((rawLine, lineIndex) => {
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     const trimmed = line.trim();
+
+    // Markdown permits blank lines inside one ordered list. Do not flush the
+    // list here: separate <ol> elements restart their visible numbering.
+    if (!trimmed && list && shouldKeepListAcrossBlank(lines, lineIndex, list.type)) {
+      return;
+    }
 
     // ---- tables (GFM-ish: header row, |---| separator, then body rows) ----
     if (isTableRow(line)) {
@@ -265,8 +262,9 @@ function TextBlock({ text }) {
     flushQuote();
 
     // ----list items ---
-    const ol = isOrderedItem(line);
-    const ul = isUnorderedItem(line);
+    const marker = parseListMarker(line);
+    const ol = marker?.type === 'ol' ? marker : null;
+    const ul = marker?.type === 'ul' ? marker : null;
     // Indent >= 2 becomes a nested sub-item. Previously those lines fell through
     // to the paragraph branch, which broke the list apart and merged the nested
     // text into the following paragraph.
