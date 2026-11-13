@@ -10,6 +10,8 @@
     "test:cors": "node scripts/corsOfflineTest.js",
     "test:server-config": "node scripts/serverConfigTest.js",
     "test:provider-config": "node scripts/providerConfigTest.js",
+    "test:provider-reliability": "node scripts/providerReliabilityTest.js",
+    "test:provider-live": "node scripts/providerLiveInferenceTest.js",
     "test:chat-path": "node scripts/chatPathTest.js",
     "test:offline-port": "node scripts/portConflictTest.js",
     "test:output": "node scripts/outputRequirementsTest.js",

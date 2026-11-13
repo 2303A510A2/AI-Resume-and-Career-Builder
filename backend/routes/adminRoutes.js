@@ -3,6 +3,7 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const { protect } = require('../middleware/authMiddleware');
 const { requireAdmin, requireMainAdmin, requirePermission, requirePasswordChanged } = require('../middleware/adminMiddleware');
+const { getProviderDiagnostics, testProviderInference } = require('../controllers/providerDiagnosticsController');
 const {
   login,
   requestAccess,
@@ -87,6 +88,8 @@ router.use(requirePasswordChanged);
 
 router.get('/stats', stats);
 router.get('/system', systemHealth);
+router.get('/ai/providers', requireMainAdmin, getProviderDiagnostics);
+router.post('/ai/providers/test', requireMainAdmin, testProviderInference);
 
 // Admin access requests — Main Admin Leader (or a co-admin granted the permission).
 router.get('/requests', requirePermission('manageRequests'), listRequests);

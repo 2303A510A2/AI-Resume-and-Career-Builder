@@ -359,6 +359,40 @@ const askCareerAssistant = async ({
     }
   }
 
+  const greetingMatch = String(question || '').trim().match(
+    /^(hi|hello|hey|howdy|good morning|good afternoon|good evening)(?: there)?[.!?,\s]*$/i
+  );
+  const hasSubstantiveHistory = history.some((turn) =>
+    turn && (turn.role === 'user' || turn.role === 'human') &&
+    !/^(hi|hello|hey|howdy|good morning|good afternoon|good evening)(?: there)?[.!?,\s]*$/i
+      .test(String(turn.content || '').trim())
+  );
+  if (
+    greetingMatch &&
+    !hasSubstantiveHistory &&
+    !extraDocuments &&
+    !attachedImages.length &&
+    !continuationAnswer
+  ) {
+    const timeGreeting = greetingMatch[1].toLowerCase();
+    const variants = timeGreeting.startsWith('good ')
+      ? [`${greetingMatch[1]}! What can I help you with today?`, `${greetingMatch[1]}! What would you like to work on?`]
+      : ['Hi! What can I help you with today?', 'Hey! What would you like to explore?', "Hello! What's on your mind?"];
+    const userTurnCount = history.filter((turn) => turn && (turn.role === 'user' || turn.role === 'human')).length;
+    const answer = variants[userTurnCount % variants.length];
+    if (typeof onDelta === 'function') await onDelta(answer);
+    return {
+      answer,
+      resources: [],
+      sources: [],
+      completion: null,
+      mode: 'none',
+      chunkCount: 0,
+      sections: [],
+      intent: 'GENERAL',
+    };
+  }
+
   // Exact arithmetic/table requests do not need a provider. This is deliberately
   // conservative: only explicit multiplication-table wording is handled here;
   // database tables, explanations, and ambiguous math stay on the LLM path.

@@ -127,6 +127,7 @@ global.fetch = async (url, init) => {
 };
 
 const runChat = async ({ respond, messages, maxTokens = 256, requestId = 'fallback-test-rid' }) => {
+  llmService.resetProviderCircuits();
   fetchCalls = [];
   responder = respond;
   const mark = captured.length;
@@ -259,7 +260,7 @@ const main = async () => {
 
     const daily = await runChat({ respond: () => http(429, BODY_TPD) });
     ok('all-quota failure surfaces AI_PROVIDERS_UNAVAILABLE', daily.error && daily.error.code === 'AI_PROVIDERS_UNAVAILABLE', daily.error ? daily.error.code : '(no error)');
-    ok('the message is the exact all-fail wording', daily.error && daily.error.message === expected, daily.error ? daily.error.message : '');
+    ok('the all-fail message retains its lead and identifies quota causes', daily.error && daily.error.message.startsWith(expected) && /Groq: daily quota exhausted/.test(daily.error.message), daily.error ? daily.error.message : '');
     ok('a quota-involved all-fail is NOT retryable', daily.error && daily.error.retryable === false, `retryable=${daily.error && daily.error.retryable}`);
     ok('the all-fail error is tagged usedFallback', daily.error && daily.error.usedFallback === true, `usedFallback=${daily.error && daily.error.usedFallback}`);
     ok('one bounded attempt per configured provider (3 calls)', daily.calls.length === 3, `${daily.calls.length} call(s)`);
@@ -268,7 +269,7 @@ const main = async () => {
 
     const outage = await runChat({ respond: () => http(503, 'service unavailable') });
     ok('all-outage failure also surfaces AI_PROVIDERS_UNAVAILABLE', outage.error && outage.error.code === 'AI_PROVIDERS_UNAVAILABLE', outage.error ? outage.error.code : '(no error)');
-    ok('all-outage uses the same exact all-fail wording', outage.error && outage.error.message === expected, outage.error ? outage.error.message : '');
+    ok('all-outage identifies providers without exposing provider response bodies', outage.error && outage.error.message.startsWith(expected) && /Groq: provider unavailable/.test(outage.error.message), outage.error ? outage.error.message : '');
     ok('an outage-only all-fail stays retryable', outage.error && outage.error.retryable === true, `retryable=${outage.error && outage.error.retryable}`);
     ok('all-outage still costs exactly one call per provider', outage.calls.length === 3, `${outage.calls.length} call(s)`);
     assertNoSecretsInLogs(outage.logs, 'all outage fail');
@@ -335,6 +336,7 @@ const main = async () => {
     ok('no provider receives a tool it was not asked to use', r.calls.every((c) => c.tools.length === 0), 'no tools');
 
     // Same request with tools must keep them on every provider.
+    llmService.resetProviderCircuits();
     fetchCalls = [];
     responder = (call) => (call.url.includes('openai.com') ? okReply('TOOL ANSWER') : http(429, BODY_TPD));
     const toolOut = await llmService.requestCompletion({

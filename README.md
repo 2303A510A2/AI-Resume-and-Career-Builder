@@ -32,7 +32,7 @@ roadmap, resume rewriting, coding preparation, and a moderation admin panel.
 | Image generation | Ask for a picture in plain language — "create an image of a red sports car on a beach", "design a poster for my DSA roadmap", "draw a neon city skyline" — and a **real** image is generated **on the backend** and rendered inside the chat bubble. A general natural-language detector (`backend/services/imageIntent.js`) separates three operations: **generate**, **understand** (an uploaded picture → vision analysis, never a generated picture) and **edit** (a reference image). Conversational follow-ups work ("make it at night", "add flying cars", "make it more realistic") because the original request is stored as `basePrompt` and merged — so "it" resolves from history. `View` (lightbox, Escape closes), `Regenerate`, `Share`, `Download`; aspect ratio preserved from the real pixels; "Creating your image…" while it works. Bytes live server-side in `GeneratedImage` and are served only through the JWT-protected, ownership-checked `GET /api/ai/images/:id`, so no provider key or URL ever reaches the browser. See [Image generation](#image-generation) |
 | Voice | 🎤 **input**: live speech recognition (Web Speech API) shows interim words while you talk; the final transcript is dropped into the normal composer so you can read, edit and then press Send — it is **never auto-sent**. Browsers without the Web Speech API fall back to MediaRecorder + Groq `whisper-large-v3-turbo` (`POST /api/ai/transcribe`). "No speech detected" is only ever shown when the recogniser genuinely produced no words; a permission / no-microphone / network failure is reported as itself. 🔊 **output**: **Listen** on any AI answer plays it back (Groq TTS mp3 when `LLM_TTS_MODEL` is set, browser `speechSynthesis` always works as fallback) with Pause / Resume / Stop |
 | Duplicate protection | Every message carries a frontend-generated `requestId`; the backend dedups it in-memory (`REQUEST_DEDUP_TTL_MS`), so double-clicks / re-renders / client retries can never fire a second LLM call or double-persist history (`deduped: true` in the reply) |
-| Resilient errors | Provider 429s read `Retry-After`/rate-limit headers, back off (max 2 retries), then a **fallback chain** — up to two automatic fallback-provider attempts (`LLM_FALLBACK_*` then `LLM_FALLBACK2_*`) — and surface only clean product strings — "The AI is temporarily busy. Please try again shortly." / "I'm having trouble generating that response right now. Please try again." with **Try Again** — never a URL, key, or HTTP status |
+| Resilient errors | Provider failures use bounded retries, a per-provider circuit breaker, and the Groq → OpenAI → Gemini fallback chain. Errors distinguish missing/invalid keys, quota/rate limits, model errors, timeouts, and outages without exposing provider response bodies or secrets. |
 | Interview prep | Question banks (+LLM generation when configured), categorized |
 | Mock interview | Start a session, answer, get heuristic evaluation (+LLM feedback when configured) |
 | Learning roadmap | Phased, topic-level plan generated from the skill gap; track progress |
@@ -425,13 +425,14 @@ REST API — no simulated AI replies anywhere. Real end-to-end chat flow:
 - `POST /api/ai/speech` — AI answer voice: `{ text }` → Groq TTS mp3 when
   `LLM_TTS_MODEL` is set; otherwise a clean 503 and the frontend falls back to
   the browser `speechSynthesis` API. Never fake audio, never a provider error.
-- Provider resilience (`backend/services/llmService.js`): ~60s per-attempt
-  timeout (`LLM_TIMEOUT_MS`), up to 2 retries with a capped backoff
+- Provider resilience (`backend/services/llmService.js`): output-budget-aware
+  per-attempt timeouts (`LLM_TIMEOUT_MS` plus optional provider-specific floors),
+  up to 2 primary retries with a capped backoff
   (`LLM_MAX_RETRIES`) that respects `Retry-After`/rate-limit headers for
   transient failures (network errors, 408/429/5xx), no retries for auth/config
   errors (401/403/404). When the primary is still unavailable after its retries
   and `LLM_FALLBACK_*`/`LLM_FALLBACK2_*` are configured, the fallback CHAIN runs —
-  one attempt per slot (primary → slot 1 → slot 2) — before the clean message is returned (provider config is centralized in
+  one attempt per fallback slot (primary → slot 1 → slot 2) — before the clean message is returned (provider config is centralized in
   `backend/services/providers.js`). The recommended deployment is
   **Groq → OpenAI → Gemini**: Groq is the primary, `LLM_FALLBACK_*` points at
   OpenAI (`https://api.openai.com/v1`, `gpt-4o-mini`) and `LLM_FALLBACK2_*` at
@@ -440,17 +441,22 @@ REST API — no simulated AI replies anywhere. Real end-to-end chat flow:
   `gemini-2.5-flash`). Each slot uses its OWN key — `LLM_FALLBACK*_API_KEY`, or
   the provider's conventional `OPENAI_API_KEY` / `GEMINI_API_KEY` /
   `GOOGLE_API_KEY` / `GROQ_API_KEY` — and a declared provider without a key is
-  skipped rather than sent the primary key. Only quota/rate-limit/5xx/network/
-  timeout/empty-response failures switch providers; raw 401/403/404/400 errors
-  never do. When every configured provider fails, the UI shows exactly:
-  **"All configured AI providers are currently unavailable or have reached their
-  usage limits. Please try again later."** (no Retry button when a daily quota
-  was involved). Raw provider URLs/keys are never shown to users.
+  skipped rather than sent the primary key. A missing or misconfigured primary
+  can be skipped when a valid fallback is configured. A bounded provider/model
+  circuit breaker suppresses repeated quota, authentication, model, timeout,
+  and outage calls until their cooldown expires. Fallback attempts are not
+  retried. When the full chain fails, the UI reports each provider's safe error
+  category and the exact missing environment-variable name, if applicable; it
+  never shows key values, provider response bodies, or credentials.
+  The Main Admin Leader can inspect cached inference state at
+  `GET /api/admin/ai/providers` and explicitly run a low-token inference check
+  with `POST /api/admin/ai/providers/test`. The POST is cached for
+  `LLM_PROVIDER_DIAGNOSTIC_COOLDOWN_MS` and is never part of `/api/health`.
+  Live checks use real provider quota; mocked tests never contact a provider.
   `GET /api/health` exposes the resolved chain as `aiFallbackChain` (names and
-  models only) and the startup log prints it too. The frontend renders exactly two
-  product strings on failure: "The AI is temporarily busy. Please try again
-  shortly." (429) or "I'm having trouble generating that response right now.
-  Please try again." with a **Try Again** button.
+  models only) and the startup log prints it too. Full-chain failures show the
+  safe per-provider cause and missing key-variable name (never the key value or
+  provider response body); transient failures retain the **Try Again** action.
 - Duplicate protection: the frontend generates a fresh `requestId` per message
   and refuses to send while a request is in flight (button/Enter disabled,
   stale-response guard); the backend dedups `${userId}:${requestId}` for
@@ -627,7 +633,10 @@ LLM_MODEL=qwen/qwen3.8-27b  # Groq default: FAST (~0.2-0.6s) and VISION-capable
                            # (image analysis works out of the box). For the
                            # text-only reasoning flagship set an explicit
                            # LLM_MODEL=openai/gpt-oss-120b (slow, ~8s/call).
-LLM_TIMEOUT_MS=60000           # ~60s per attempt (optional)
+LLM_TIMEOUT_MS=60000           # request timeout floor (optional)
+LLM_GROQ_TIMEOUT_MS=20000      # optional provider-specific floor
+LLM_OPENAI_TIMEOUT_MS=20000    # optional provider-specific floor
+LLM_GEMINI_TIMEOUT_MS=20000    # optional provider-specific floor
 LLM_MAX_RETRIES=2              # transient-failure retries (optional)
 REQUEST_DEDUP_TTL_MS=60000     # in-memory requestId dedup window (duplicate protection)
 # Optional FALLBACK AI providers — automatic CHAIN used ONLY when the primary is
@@ -688,6 +697,9 @@ node scripts/outputRequirementsTest.js  # 151/151 output-requirement engine chec
 node scripts/chatPathTest.js       # 73/73 chat-path + continuation checks, stubbed provider (no server/key/DB)
 node scripts/providerErrorTest.js  # 178/178 provider-error + fallback-chain + retry-honoring + 413 checks, stubbed fetch (no server/key/DB)
 node scripts/providerFallbackTest.js # 68/68 Groq->OpenAI->Gemini fallback contract, stubbed fetch (no server/key/DB)
+node scripts/providerReliabilityTest.js # missing-key fallback, circuit breaker, diagnostics, streaming, and log-redaction checks (mocked)
+node scripts/providerDiagnostic.js   # sanitized real-inference status report for configured providers
+RUN_PROVIDER_LIVE=1 node scripts/providerLiveInferenceTest.js # real Java/LeetCode/timetable inference; spends provider quota
 node scripts/responseQualityTest.js # live "did it fulfil the request?" suite (needs quota)
 node scripts/intentTest.js         # 68/68 image-intent detector checks (no server needed)
 node scripts/imageTest.js          # image end-to-end suite (needs a running backend)

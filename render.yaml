@@ -68,6 +68,16 @@ services:
         value: gemini-2.5-flash
       - key: LLM_FALLBACK2_API_KEY
         sync: false
+      - key: LLM_PROVIDER_CIRCUIT_COOLDOWN_MS
+        value: 30000
+      - key: LLM_PROVIDER_RATE_LIMIT_COOLDOWN_MS
+        value: 60000
+      - key: LLM_PROVIDER_DAILY_COOLDOWN_MS
+        value: 21600000
+      - key: LLM_PROVIDER_CONFIG_COOLDOWN_MS
+        value: 1800000
+      - key: LLM_PROVIDER_DIAGNOSTIC_COOLDOWN_MS
+        value: 300000
       - key: EMBEDDING_MODEL
         sync: false
       - key: EMBEDDING_API_KEY

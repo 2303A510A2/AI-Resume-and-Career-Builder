@@ -9,10 +9,9 @@
 //   LLM_BASE_URL || AI_BASE_URL        (defaults per provider, Groq/OpenAI)
 //   LLM_MODEL    || AI_MODEL           (defaults per provider)
 //
-// FALLBACK provider (used automatically when the primary is temporarily
-// unavailable after its own retries — one extra attempt, then a clean message):
-//   LLM_FALLBACK_PROVIDER, LLM_FALLBACK_API_KEY,
-//   LLM_FALLBACK_BASE_URL, LLM_FALLBACK_MODEL
+// FALLBACK chain (up to two providers, tried in order after the primary):
+//   LLM_FALLBACK_* and LLM_FALLBACK2_* each accept provider, key, base URL,
+//   and model settings; each configured slot receives one attempt.
 //
 // VISION (image analysis in chat):
 //   LLM_VISION=1                       enables image input on vision-capable models
@@ -27,6 +26,7 @@
 
 const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
 const OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const PRIMARY_API_KEY_ENV_NAMES = ['LLM_API_KEY', 'AI_API_KEY', 'GROQ_API_KEY', 'OPENAI_API_KEY'];
 // Gemini exposes an officially supported OpenAI-compatible API (same
 // /chat/completions shape, Bearer auth). This is the canonical root; the
 // provider layer appends `/chat/completions` exactly like OpenAI/Groq.
@@ -83,6 +83,11 @@ const resolveApiKey = (...candidates) => {
   return '';
 };
 
+const sourceForKey = (apiKey, names) =>
+  apiKey
+    ? names.find((name) => String(process.env[name] || '').trim() === apiKey) || ''
+    : '';
+
 const defaultModelFor = (provider) => {
   if (provider === 'groq') return GROQ_DEFAULT_MODEL;
   if (provider === 'gemini') return GEMINI_DEFAULT_MODEL;
@@ -97,12 +102,8 @@ const defaultBaseFor = (provider) => {
 
 /** Builds the PRIMARY provider config (backwards-compatible with llmService.getConfig). */
 const primary = () => {
-  const apiKey = resolveApiKey(
-    process.env.LLM_API_KEY,
-    process.env.AI_API_KEY,
-    process.env.GROQ_API_KEY,
-    process.env.OPENAI_API_KEY
-  );
+  const apiKey = resolveApiKey(...PRIMARY_API_KEY_ENV_NAMES.map((name) => process.env[name]));
+  const apiKeySource = sourceForKey(apiKey, PRIMARY_API_KEY_ENV_NAMES);
   let baseUrl = normalizeBase(process.env.LLM_BASE_URL || process.env.AI_BASE_URL);
   let configuredProvider = String(process.env.LLM_PROVIDER || process.env.AI_PROVIDER || '').trim().toLowerCase();
   // A Groq/Gemini key is unambiguous when no provider or endpoint was
@@ -118,7 +119,7 @@ const primary = () => {
   let model = String(process.env.LLM_MODEL || process.env.AI_MODEL || '').trim();
   if (!model) model = defaultModelFor(provider);
 
-  return { provider, baseUrl, model, apiKey };
+  return { provider, baseUrl, model, apiKey, apiKeySource };
 };
 
 const configurationIssue = (cfg = primary()) => {
@@ -127,8 +128,23 @@ const configurationIssue = (cfg = primary()) => {
   if (provider === 'groq' && !/groq\.com/.test(baseUrl)) {
     return 'LLM_PROVIDER=groq requires LLM_BASE_URL=https://api.groq.com/openai/v1.';
   }
+  if (
+    provider === 'groq' &&
+    (cfg.apiKeySource === 'OPENAI_API_KEY' || /^sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]+$/i.test(String(cfg.apiKey || '')))
+  ) {
+    return 'The configured key appears to be an OpenAI key; Groq requires its own Groq API key.';
+  }
   if (isGroqApiKey(cfg.apiKey) && provider !== 'groq') {
     return 'A Groq API key requires LLM_PROVIDER=groq and the Groq OpenAI-compatible LLM_BASE_URL.';
+  }
+  if (
+    provider === 'gemini' &&
+    (/^gsk_/i.test(String(cfg.apiKey || '')) || /^sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]+$/i.test(String(cfg.apiKey || '')))
+  ) {
+    return 'The configured key appears to belong to another provider; Gemini requires its own Google AI API key.';
+  }
+  if (provider !== 'ollama' && PROVIDER_HOST_RE[provider] && !hostMatchesProvider(provider, baseUrl)) {
+    return `The configured ${provider} provider base URL does not match that provider's host.`;
   }
   return '';
 };
@@ -155,6 +171,9 @@ const aliasKeyFor = (provider) => {
   }
   return '';
 };
+
+const aliasKeySourceFor = (provider) =>
+  (PROVIDER_KEY_ALIASES[provider] || []).find((name) => String(process.env[name] || '').trim()) || '';
 
 // Known host per provider — used to prove that a base URL really belongs to the
 // provider whose conventional key we are about to reuse. An unknown/custom host
@@ -210,9 +229,10 @@ const buildFallback = (prefix) => {
     });
     const apiKey = explicitKey || aliasKeyFor(provider);
     if (!apiKey) return null; // incomplete config: never reuse a foreign primary key
+    const apiKeySource = explicitKey ? `${prefix}_API_KEY` : aliasKeySourceFor(provider);
     const baseUrl = normalizeBase(declaredBase || defaultBaseFor(provider), provider);
     const model = declaredModel || defaultModelFor(provider);
-    return { provider, baseUrl, model, apiKey };
+    return { provider, baseUrl, model, apiKey, apiKeySource };
   }
 
   // ---- 2. Explicit slot key, provider inferred from key/base URL ----
@@ -225,7 +245,13 @@ const buildFallback = (prefix) => {
     });
     const baseUrl = normalizeBase(declaredBase || defaultBaseFor(provider), provider);
     const model = declaredModel || defaultModelFor(provider);
-    return { provider, baseUrl, model, apiKey: explicitKey };
+    return {
+      provider,
+      baseUrl,
+      model,
+      apiKey: explicitKey,
+      apiKeySource: `${prefix}_API_KEY`,
+    };
   }
 
   // ---- 3. Same-key model reuse (no provider, no explicit key) ----
@@ -257,9 +283,16 @@ const buildFallback = (prefix) => {
       baseUrl: normalizeBase(baseUrl, provider),
       model: declaredModel || defaultModelFor(provider),
       apiKey,
+      apiKeySource: aliasKeySourceFor(provider),
     };
   }
-  return { provider: cfg.provider, baseUrl, model: declaredModel || cfg.model, apiKey };
+  return {
+    provider: cfg.provider,
+    baseUrl,
+    model: declaredModel || cfg.model,
+    apiKey,
+    apiKeySource: cfg.apiKeySource || '',
+  };
 };
 
 /** Safe per-slot diagnostic: declared vs actually usable, without any secret. */
@@ -274,10 +307,11 @@ const fallbackSlotStatus = (prefix) => {
   return {
     declared,
     configured: Boolean(cfg && isConfigured(cfg)),
-    provider: cfg ? cfg.provider : '',
-    model: cfg ? cfg.model : '',
-    baseUrl: cfg ? cfg.baseUrl : '',
+    provider: cfg ? cfg.provider : String(process.env[`${prefix}_PROVIDER`] || '').trim().toLowerCase(),
+    model: cfg ? cfg.model : String(process.env[`${prefix}_MODEL`] || '').trim(),
+    baseUrl: cfg ? cfg.baseUrl : normalizeBase(process.env[`${prefix}_BASE_URL`] || ''),
     apiKeyConfigured: Boolean(cfg && cfg.apiKey),
+    apiKeySource: cfg ? cfg.apiKeySource || '' : '',
   };
 };
 
@@ -292,6 +326,56 @@ const fallback2 = () => buildFallback('LLM_FALLBACK2');
  * order (max 2). Each config is a real provider the app is allowed to call.
  */
 const allFallbacks = () => [fallback(), fallback2()].filter((f) => f && isConfigured(f));
+
+const diagnosticTargets = () => {
+  const p = primary();
+  const targets = [{
+    slot: 'primary',
+    declared: true,
+    provider: p.provider,
+    baseUrl: p.baseUrl,
+    model: p.model,
+    configured: isConfigured(p),
+    apiKeyConfigured: Boolean(p.apiKey) || p.provider === 'ollama',
+    apiKeySource: p.apiKeySource || '',
+    missingKeyVariable: p.provider === 'ollama'
+      ? ''
+      : (p.apiKeySource ? '' : PRIMARY_API_KEY_ENV_NAMES.join(' or ')),
+  }];
+
+  for (const [prefix, slot] of [['LLM_FALLBACK', 'fallback1'], ['LLM_FALLBACK2', 'fallback2']]) {
+    const status = fallbackSlotStatus(prefix);
+    if (!status.declared) continue;
+    const declaredProvider = String(process.env[`${prefix}_PROVIDER`] || '').trim().toLowerCase();
+    const explicitKey = String(process.env[`${prefix}_API_KEY`] || '').trim();
+    const declaredBase = normalizeBase(process.env[`${prefix}_BASE_URL`] || '', p.provider);
+    const usesPrimaryKey = !declaredProvider && !explicitKey &&
+      (!declaredBase || declaredBase.toLowerCase() === p.baseUrl.toLowerCase());
+    const provider = status.provider || (usesPrimaryKey ? p.provider : resolveProviderId({
+      configured: '',
+      baseUrl: status.baseUrl,
+      hasKey: false,
+      apiKey: '',
+    }));
+    const alias = aliasKeySourceFor(provider);
+    targets.push({
+      slot,
+      declared: true,
+      provider,
+      baseUrl: status.baseUrl || defaultBaseFor(provider),
+      model: status.model || defaultModelFor(provider),
+      configured: status.configured,
+      apiKeyConfigured: status.apiKeyConfigured,
+      apiKeySource: status.apiKeySource || '',
+      missingKeyVariable: status.configured
+        ? ''
+        : usesPrimaryKey
+          ? PRIMARY_API_KEY_ENV_NAMES.join(' or ')
+          : `${prefix}_API_KEY${alias ? ` or ${alias}` : ` or ${({ groq: 'GROQ_API_KEY', openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY' })[provider] || 'provider API key'}`}`,
+    });
+  }
+  return targets;
+};
 
 const isConfigured = (cfg) => Boolean(cfg && cfg.apiKey) || (cfg && cfg.provider === 'ollama');
 
@@ -358,18 +442,20 @@ const describe = () => {
     baseUrl: p.baseUrl,
     model: p.model,
     apiKeyConfigured: Boolean(p.apiKey),
+    apiKeySource: p.apiKeySource || '',
     configured: isConfigured(p),
     fallback: f
-      ? { provider: f.provider, baseUrl: f.baseUrl, model: f.model, apiKeyConfigured: Boolean(f.apiKey) }
+      ? { provider: f.provider, baseUrl: f.baseUrl, model: f.model, apiKeyConfigured: Boolean(f.apiKey), apiKeySource: f.apiKeySource || '' }
       : null,
     fallback2: f2
-      ? { provider: f2.provider, baseUrl: f2.baseUrl, model: f2.model, apiKeyConfigured: Boolean(f2.apiKey) }
+      ? { provider: f2.provider, baseUrl: f2.baseUrl, model: f2.model, apiKeyConfigured: Boolean(f2.apiKey), apiKeySource: f2.apiKeySource || '' }
       : null,
     fallback1Declared: slot1.declared,
     fallback1Configured: slot1.configured,
     fallback2Declared: slot2.declared,
     fallback2Configured: slot2.configured,
     fallbackChain: allFallbacks().map((x) => ({ provider: x.provider, model: x.model })),
+    diagnosticTargets: diagnosticTargets(),
     vision: isVisionEnabled(),
   };
 };
@@ -380,6 +466,7 @@ module.exports = {
   fallback,
   fallback2,
   allFallbacks,
+  diagnosticTargets,
   isConfigured,
   looksLikeGroq,
   isVisionEnabled,

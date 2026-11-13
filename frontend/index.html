@@ -4821,8 +4821,12 @@ function backendErrorText(err) {
      fallback, then gave up). Retry is offered only when the backend says a retry
      could help — a spent daily quota (retryable:false) hides the button. */
   if (api === "AI_PROVIDERS_UNAVAILABLE") {
+    var providerSummary = msg.indexOf("All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.") === 0
+      ? msg.slice("All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.".length).trim()
+      : "";
     return {
-      text: "**All configured AI providers are currently unavailable or have reached their usage limits.**\n\nPlease try again later.",
+      text: "**All configured AI providers are currently unavailable or have reached their usage limits.**\n\nPlease try again later." +
+        (providerSummary ? "\n\n" + providerSummary : ""),
       retryable: err.retryable !== false,
     };
   }

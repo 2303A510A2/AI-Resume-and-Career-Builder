@@ -144,8 +144,10 @@ const friendlyError = async (err) => {
   // fallback, then gave up). Retry is offered only when the backend says a retry
   // could help (both failures were transient). A spent daily quota keeps it off.
   if (code === 'AI_PROVIDERS_UNAVAILABLE') {
+    const providerMessage = String(err?.response?.data?.message || '').trim();
     return {
-      text: 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.',
+      text: providerMessage ||
+        'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.',
       signOut: false,
       retryable: err?.response?.data?.retryable !== false,
     };

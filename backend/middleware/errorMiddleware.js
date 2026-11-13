@@ -25,6 +25,7 @@ const errorHandler = (err, req, res, next) => {
     success: false,
     message: err.expose || err.isOperational ? err.message : 'Something went wrong',
     ...(err.code ? { code: err.code } : {}),
+    ...(Array.isArray(err.providerFailures) ? { providerFailures: err.providerFailures } : {}),
     // Honest retry hint for AI errors: the provider layer already decided whether
     // a retry could help (a spent daily quota -> false; transient 5xx/network ->
     // true). The frontend uses it to gate its Retry button per error, so a

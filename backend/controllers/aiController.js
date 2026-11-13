@@ -648,6 +648,7 @@ const careerAssistantStream = async (req, res) => {
           ? 'Generation stopped. The partial answer was preserved.'
           : (err?.isOperational ? String(err.message) : 'The AI response could not be completed.'),
         retryable: err?.retryable !== false,
+        ...(Array.isArray(err?.providerFailures) ? { providerFailures: err.providerFailures } : {}),
       });
       res.end();
     }

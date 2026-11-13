@@ -82,6 +82,15 @@ const PROVIDER_MAX_QUEUE = Math.max(0, Math.min(100, Number(process.env.LLM_PROV
 // while still allowing different providers in the fallback chain to run
 // independently.
 const providerSlots = new Map();
+const providerCircuits = new Map();
+const providerInferenceDiagnostics = new Map();
+let providerDiagnosticRunPromise = null;
+let providerDiagnosticLastRunAt = 0;
+const PROVIDER_CIRCUIT_COOLDOWN_MS = Number(process.env.LLM_PROVIDER_CIRCUIT_COOLDOWN_MS || 30000);
+const PROVIDER_RATE_LIMIT_COOLDOWN_MS = Number(process.env.LLM_PROVIDER_RATE_LIMIT_COOLDOWN_MS || 60000);
+const PROVIDER_DAILY_COOLDOWN_MS = Number(process.env.LLM_PROVIDER_DAILY_COOLDOWN_MS || 21600000);
+const PROVIDER_CONFIG_COOLDOWN_MS = Number(process.env.LLM_PROVIDER_CONFIG_COOLDOWN_MS || 1800000);
+const PROVIDER_DIAGNOSTIC_COOLDOWN_MS = Number(process.env.LLM_PROVIDER_DIAGNOSTIC_COOLDOWN_MS || 300000);
 
 const providerSlot = (provider) => {
   const key = String(provider || 'unknown').toLowerCase();
@@ -257,19 +266,6 @@ const DAILY_QUOTA_RE =
 const RPM_QUOTA_RE = /requests per minute|\brpm\b/i;
 const TPM_QUOTA_RE = /tokens per minute|\btpm\b/i;
 
-// Scrubs anything that could look like a secret from a provider error body
-// before it ever reaches logs/diagnostics (belt & braces — never log keys).
-const scrubSecret = (text) =>
-  String(text || '')
-    .replace(/gsk_[A-Za-z0-9_-]{10,}/g, '[key-redacted]')
-    .replace(/Bearer\s+[A-Za-z0-9._\-]{10,}/gi, '[bearer-redacted]');
-
-// Provider's own error wording, trimmed + scrubbed, for server-side diagnostics.
-const cleanProviderReason = (bodyText) => {
-  const t = scrubSecret(bodyText).replace(/\s+/g, ' ').trim();
-  return t ? `provider said: ${t.slice(0, 300)}` : '';
-};
-
 // Statuses that are transient provider/network failures and are safe to retry.
 // Auth (401/403) and config (404) errors are NEVER retried — retrying them only
 // hammers the provider without ever succeeding.
@@ -281,6 +277,8 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 // (400 validation, 401 auth, 403 authorization, 404 bad model/route) NEVER
 // switch providers — the fallback would hit the same ineligible request.
 const FALLBACKABLE_CODES = new Set([
+  'AI_NOT_CONFIGURED',        // missing primary key: use a configured fallback
+  'AI_CONFIGURATION_ERROR',   // primary endpoint/config mismatch: do not send its key
   'AI_DAILY_LIMIT',          // daily allowance spent — the classic reason to switch
   'AI_RATE_LIMITED',         // per-minute pressure after the primary gave up
   'AI_PROVIDER_ERROR',       // provider 5xx
@@ -352,10 +350,13 @@ const clampInt = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.round(Number(n) |
  * CHAT_TIMEOUT_MS (floor, so a 4-token answer still gets 20s) and
  * LONG_TIMEOUT_MS (ceiling, so the request can never hang forever).
  */
-const perAttemptTimeoutMs = (maxTokens) => {
+const perAttemptTimeoutMs = (maxTokens, provider = '') => {
   const tokens = clampInt(maxTokens, MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS);
+  const providerFloor = provider
+    ? Number(process.env[`LLM_${String(provider).toUpperCase()}_TIMEOUT_MS`] || CHAT_TIMEOUT_MS)
+    : CHAT_TIMEOUT_MS;
   return clampInt(
-    CHAT_TIMEOUT_MS + Math.ceil(tokens / TOKENS_PER_SEC_BUDGET) * 1000,
+    providerFloor + Math.ceil(tokens / TOKENS_PER_SEC_BUDGET) * 1000,
     CHAT_TIMEOUT_MS,
     LONG_TIMEOUT_MS
   );
@@ -411,6 +412,8 @@ const getFallbackConfig = () => providers.fallback();
 const getFallbackChain = () => providers.allFallbacks();
 
 const isConfigured = () => providers.isConfigured(providers.primary());
+const hasAnyConfiguredProvider = () =>
+  isConfigured() || getFallbackChain().length > 0;
 
 /** True when the configured LLM provider supports Groq's built-in browser search. */
 const supportsBrowserSearch = () => {
@@ -431,6 +434,17 @@ const notConfiguredError = (extra = '') => {
   return err;
 };
 
+const providerConfigurationError = (cfg, issue) => {
+  const err = apiError(
+    `${providerLabel(cfg.provider)} is misconfigured. Check its provider name, model, base URL, and API key variable.`,
+    503,
+    'AI_CONFIGURATION_ERROR',
+    `${cfg.provider}/${cfg.model}: ${issue}`
+  );
+  err.retryable = false;
+  return err;
+};
+
 const apiError = (message, statusCode, code, detail = '') => {
   const err = new Error(message);
   err.statusCode = statusCode;
@@ -438,6 +452,88 @@ const apiError = (message, statusCode, code, detail = '') => {
   err.code = code;
   if (detail) err.detail = detail; // server-side diagnostics; never contains the API key
   return err;
+};
+
+const providerCircuitKey = (cfg) =>
+  `${String(cfg.provider || '').toLowerCase()}|${String(cfg.baseUrl || '').toLowerCase()}|${String(cfg.model || '')}`;
+
+const activeProviderCircuit = (cfg) => {
+  const key = providerCircuitKey(cfg);
+  const circuit = providerCircuits.get(key);
+  if (!circuit) return null;
+  if (circuit.openUntil <= Date.now()) {
+    providerCircuits.delete(key);
+    return null;
+  }
+  return circuit;
+};
+
+const clearProviderCircuit = (cfg) => providerCircuits.delete(providerCircuitKey(cfg));
+
+const circuitCooldownFor = (err) => {
+  if (err.code === 'AI_DAILY_LIMIT') {
+    return Math.max(PROVIDER_DAILY_COOLDOWN_MS, Number(err.retryAfterMs) || 0);
+  }
+  if (err.code === 'AI_RATE_LIMITED') {
+    return Math.max(PROVIDER_RATE_LIMIT_COOLDOWN_MS, Number(err.retryAfterMs) || 0);
+  }
+  if (['AI_AUTH_INVALID', 'AI_AUTH_FORBIDDEN', 'AI_MODEL_UNAVAILABLE', 'AI_NOT_FOUND'].includes(err.code)) {
+    return PROVIDER_CONFIG_COOLDOWN_MS;
+  }
+  return PROVIDER_CIRCUIT_COOLDOWN_MS;
+};
+
+const recordProviderFailure = (cfg, err) => {
+  const rawStatus = Number(err && err.providerHttpStatus) || 0;
+  if (!err || err.code === 'AI_NOT_CONFIGURED') return;
+  if (!err || (!FALLBACKABLE_CODES.has(err.code) && ![401, 403, 404].includes(rawStatus))) return;
+  providerCircuits.set(providerCircuitKey(cfg), {
+    provider: cfg.provider,
+    model: cfg.model,
+    code: err.code || 'AI_PROVIDER_ERROR',
+    httpStatus: rawStatus || null,
+    rateLimitKind: err.rateLimitKind || '',
+    providerFailureKind: err.providerFailureKind || '',
+    openedAt: Date.now(),
+    openUntil: Date.now() + Math.max(1000, circuitCooldownFor(err)),
+  });
+};
+
+const providerCircuitError = (cfg, circuit) => {
+  const label = providerLabel(cfg.provider);
+  const error = apiError(
+    `${label} ${providerFailureLabel(circuit)}; skipping it until its temporary cooldown expires.`,
+    503,
+    circuit.code,
+    `${label}/${cfg.model} circuit open until ${new Date(circuit.openUntil).toISOString()}`
+  );
+  error.providerHttpStatus = circuit.httpStatus;
+  error.rateLimitKind = circuit.rateLimitKind;
+  error.providerFailureKind = circuit.providerFailureKind || '';
+  error.retryable = circuit.code !== 'AI_DAILY_LIMIT';
+  return error;
+};
+
+const providerErrorCategory = (error) => {
+  const code = String(error && error.code || '');
+  const status = Number(error && error.providerHttpStatus) || 0;
+  if (code === 'AI_NOT_CONFIGURED') return 'missing_api_key';
+  if (code === 'AI_CONFIGURATION_ERROR') return 'configuration';
+  if (code === 'AI_AUTH_INVALID') return 'invalid_api_key';
+  if (code === 'AI_AUTH_FORBIDDEN') return 'key_or_model_forbidden';
+  if (code === 'AI_MODEL_UNAVAILABLE') return 'invalid_model';
+  if (code === 'AI_NOT_FOUND') return 'endpoint_not_found';
+  if (code === 'AI_DAILY_LIMIT') return 'quota_exhausted';
+  if (code === 'AI_RATE_LIMITED') return error.rateLimitKind === 'daily' ? 'quota_exhausted' : 'rate_limited';
+  if (code === 'AI_UNREACHABLE') return error.providerFailureKind || 'network';
+  if (code === 'AI_EMPTY_RESPONSE') return 'empty_response';
+  if ([401].includes(status)) return 'invalid_api_key';
+  if ([403].includes(status)) return 'key_or_model_forbidden';
+  if ([404].includes(status)) return 'invalid_model_or_endpoint';
+  if ([408, 504].includes(status)) return 'timeout';
+  if (status === 429) return 'rate_limited';
+  if (status >= 500) return 'provider_unavailable';
+  return code ? code.replace(/^AI_/, '').toLowerCase() : 'provider_error';
 };
 
 /**
@@ -555,7 +651,7 @@ const classifyStatus = (status, bodyText, model, baseUrl, extraDetail = '') => {
     `The AI provider returned an unexpected error (HTTP ${status}). Please try again.`,
     502,
     'AI_PROVIDER_ERROR',
-    `${tail} HTTP ${status} ${bodyText.slice(0, 200)}`
+    `${tail} HTTP ${status} provider error (response body omitted).`
   );
 };
 
@@ -610,37 +706,35 @@ const parseRetryAfterFromBody = (bodyText) => {
 
 /**
  * Clean, honest error for an exhausted daily quota. The client-facing message
- * stays calm and tells the user the TWO real options (wait for the reset, or
- * configure another provider); the real provider reason goes into `detail`
- * (server logs only). Marked `retryable: false` so no UI offers a Retry button
- * that cannot work until the quota resets.
+ * tells the user the TWO real options (wait for the reset, or configure another
+ * provider). Marked `retryable: false` so no UI offers a Retry button that
+ * cannot work until the quota resets.
  */
-const dailyQuotaError = ({ provider, bodyText, retryAfterMs, extraDetail, reqTag }) => {
-  const reason = cleanProviderReason(bodyText) || 'daily token quota exhausted';
+const dailyQuotaError = ({ provider, retryAfterMs, extraDetail, reqTag }) => {
   const err = apiError(
     'Today\'s AI provider quota has been reached. Configure another AI provider or try again after the quota resets.',
     502,
     'AI_DAILY_LIMIT',
-    `${extraDetail} ${provider} daily quota exhausted (retry-after ${retryAfterMs ? (retryAfterMs / 1000).toFixed(1) + 's' : '-'}). ${reason} ${reqTag}(stopped early — retrying a daily-limit 429 only burns time)`
+    `${extraDetail} ${provider} daily quota exhausted (retry-after ${retryAfterMs ? (retryAfterMs / 1000).toFixed(1) + 's' : '-'}). ${reqTag}(stopped early — retrying a daily-limit 429 only burns time)`
   );
   err.isOperational = true;
   err.retryable = false; // a spent daily allowance never recovers inside this request
   err.rateLimitKind = 'daily';
   err.providerHttpStatus = 429; // raw provider status, for the fallback gate
+  err.retryAfterMs = Number(retryAfterMs) || 0;
   return err;
 };
 
 /**
- * Server-side failure diagnostics in the [AI ERROR] format: requestId, provider,
- * model, the RAW provider HTTP status + our client status, rate-limit kind, code
- * and the real provider reason. NEVER the API key or Authorization header
- * (scrubSecret guards the provider text).
+ * Server-side failure diagnostics use safe metadata only: requestId, provider,
+ * model, status, rate-limit kind, and the classified error code. Provider
+ * response bodies are never logged because they can contain sensitive data.
  *
  * `http` is the status the PROVIDER sent (429/500/503…); `status` is the status
  * the client will receive. Both matter: a provider 429 answered to a client as
  * 502 is still a rate limit, and only `http` shows that.
  */
-const aiErrorLog = ({ requestId = '', provider = '', model = '', status = '', http = '', kind = '', durationMs, attempts, code = '', detail = '', providerReason = '' }) => {
+const aiErrorLog = ({ requestId = '', provider = '', model = '', status = '', http = '', kind = '', durationMs, attempts, code = '' }) => {
   const parts = [
     requestId ? `requestId=${requestId}` : '',
     provider ? `provider=${provider}` : '',
@@ -653,8 +747,6 @@ const aiErrorLog = ({ requestId = '', provider = '', model = '', status = '', ht
     kind ? `type=${kind}` : '',
   ].filter(Boolean);
   console.error(`[AI ERROR] ${parts.join(' ')}`);
-  const real = providerReason || detail || '';
-  if (real) console.error(`[AI ERROR] ${scrubSecret(real).replace(/\s+/g, ' ').slice(0, 500)}`);
 };
 
 /**
@@ -743,7 +835,7 @@ const attemptWithProvider = async (cfg, {
   const requestedBudget = clampInt(maxTokens, MIN_OUTPUT_TOKENS, limits.output);
   // Per-attempt wall clock scales with that budget (see perAttemptTimeoutMs), and
   // the total request deadline is derived from it so the two can never disagree.
-  const attemptTimeoutMs = perAttemptTimeoutMs(requestedBudget);
+  const attemptTimeoutMs = perAttemptTimeoutMs(requestedBudget, cfg.provider);
   const deadlineAt = startedAt + Math.max(REQUEST_DEADLINE_MS, attemptTimeoutMs * total + 2000);
 
   let lastErr = null;
@@ -752,7 +844,6 @@ const attemptWithProvider = async (cfg, {
   let tokenBudget = requestedBudget;
   let attemptCount = 0;
   let rateLimitAttempts = 0; // 429s get AT MOST ONE retry (never a ~40s retry storm)
-  let providerReason = '';
   let lastStatus = null; // HTTP status of the latest attempt (for backoff choice)
   let budgetDowngrades = 0; // how many times we halved max_tokens on a provider 400
 
@@ -805,6 +896,7 @@ const attemptWithProvider = async (cfg, {
             ? `request timed out after ${Math.round(attemptTimeoutMs / 1000)}s (max_tokens=${tokenBudget})`
             : `network error: ${err.message}`}`
         );
+        lastErr.providerFailureKind = timedOut ? 'timeout' : 'network';
         lastErr.retryable = true; // transient network/timeout failures are retried
         retryable = true;
       }
@@ -829,7 +921,6 @@ const attemptWithProvider = async (cfg, {
           const bodyText = await resp.text().catch(() => '');
           const extra = `retryAfter=${retryAfterMs ? retryAfterMs / 1000 + 's' : '-'} remainingTokens=${remainingTokens || '-'} remainingRequests=${remainingRequests || '-'}`;
           lastErr = classifyStatus(resp.status, bodyText, cfg.model, cfg.baseUrl, extra);
-          providerReason = cleanProviderReason(bodyText);
           retryable = RETRYABLE_STATUS.has(resp.status); // auth/config errors end immediately
 
           // The provider rejected the request as TOO LARGE — either max_tokens
@@ -848,7 +939,7 @@ const attemptWithProvider = async (cfg, {
                 : 'The configured AI model cannot produce an answer this long in one pass. Retrying with a smaller budget.',
               502,
               perMinute ? 'AI_RATE_LIMITED' : 'AI_BUDGET_TOO_LARGE',
-              `${reqTag}provider=${cfg.provider} HTTP ${resp.status} request-too-large (downgrading max_tokens to ${tokenBudget}, attempt ${attempt + 1}) ${cleanProviderReason(bodyText)}`
+              `${reqTag}provider=${cfg.provider} HTTP ${resp.status} request-too-large (downgrading max_tokens to ${tokenBudget}, attempt ${attempt + 1})`
             );
             lastErr.providerHttpStatus = resp.status; // 413 stays fallbackable; 400 does not
             lastErr.retryable = true;
@@ -870,7 +961,7 @@ const attemptWithProvider = async (cfg, {
             // ONE bounded retry below.
             if (kind === 'daily') {
               retryable = false;
-              lastErr = dailyQuotaError({ provider: cfg.provider, bodyText, retryAfterMs, extraDetail: extra, reqTag });
+              lastErr = dailyQuotaError({ provider: cfg.provider, retryAfterMs, extraDetail: extra, reqTag });
             } else {
               // Per-minute / concurrency pressure: max ONE retry total.
               retryable = rateLimitAttempts < 2;
@@ -985,10 +1076,9 @@ const attemptWithProvider = async (cfg, {
   }
 
   if (!lastErr) lastErr = apiError('The AI provider is unreachable right now — the request timed out or the network failed. Please try again in a moment.', 503, 'AI_UNREACHABLE');
-  // End-to-end provider trace (safe: requestId, raw HTTP status, classified
-  // reason — never the key, Authorization header, body or JWT).
+  // End-to-end provider trace uses only safe metadata and the classified code.
   if (DEV_LOG) console.log(`[AI PROVIDER ERROR]${requestId ? ` requestId=${requestId}` : ''} status=${lastStatus || lastErr.statusCode || 502} reason=${lastErr.code || 'error'}`);
-  // Server-side real-error diagnostics — logs the provider's own reason.
+  // Provider response bodies can contain sensitive material; log metadata only.
   aiErrorLog({
     requestId,
     provider: cfg.provider,
@@ -999,8 +1089,6 @@ const attemptWithProvider = async (cfg, {
     durationMs: Date.now() - startedAt,
     attempts: attemptCount,
     code: lastErr.code,
-    detail: `${lastErr.detail || ''}${budgetDowngrades ? ` maxTokensBudgetDowngrades=${budgetDowngrades}` : ''}`,
-    providerReason,
   });
   return { ok: false, error: lastErr, retryAfterMs, rateLimit, attempts: attemptCount, attemptUsable: true, lastAttemptDurationMs: Date.now() - startedAt };
 };
@@ -1024,6 +1112,51 @@ const aiLog = ({ requestId = '', provider = '', model = '', status = '', duratio
 
 // Tag used when a provider failure is finally surfaced (from a clean error code).
 const aiCategoryFromCode = (code) => String(code || 'AI_PROVIDER_ERROR').replace(/^AI_/, '');
+
+const providerFailureLabel = (error) => {
+  const category = providerErrorCategory(error);
+  const labels = {
+    missing_api_key: 'API key missing',
+    configuration: 'provider configuration mismatch',
+    invalid_api_key: 'invalid API key',
+    key_or_model_forbidden: 'key or model is not authorized',
+    invalid_model: 'model unavailable',
+    endpoint_not_found: 'endpoint not found',
+    invalid_model_or_endpoint: 'model or endpoint not found',
+    quota_exhausted: 'daily quota exhausted',
+    rate_limited: 'rate limit reached',
+    timeout: 'request timed out',
+    network: 'network connection failed',
+    provider_unavailable: 'provider unavailable',
+    empty_response: 'provider returned an empty response',
+  };
+  return labels[category] || 'provider request failed';
+};
+
+const safeProviderFailure = (cfg, error, slot = '') => {
+  const target = providers.diagnosticTargets().find((item) => item.slot === slot);
+  return {
+    provider: String(cfg.provider || ''),
+    model: String(cfg.model || ''),
+    category: providerErrorCategory(error),
+    reason: providerFailureLabel(error),
+    httpStatus: Number(error && error.providerHttpStatus) || null,
+    rateLimitKind: String(error && error.rateLimitKind || ''),
+    ...(error && error.code === 'AI_NOT_CONFIGURED' && target && target.missingKeyVariable
+      ? { missingKeyVariable: target.missingKeyVariable }
+      : {}),
+  };
+};
+
+const allProvidersFailureMessage = (failures) => {
+  const detail = failures
+    .map((failure) => {
+      const missing = failure.missingKeyVariable ? `; set ${failure.missingKeyVariable}` : '';
+      return `${providerLabel(failure.provider)}: ${failure.reason}${missing}`;
+    })
+    .join('. ');
+  return detail ? `${ALL_PROVIDERS_FAILED_MESSAGE} ${detail}.` : ALL_PROVIDERS_FAILED_MESSAGE;
+};
 
 /**
  * Resolves which provider config to use for a request that PINS a provider
@@ -1087,12 +1220,11 @@ const requestCompletion = async ({
   onDelta,
   abortSignal,
 }) => {
-  if (!isConfigured()) throw notConfiguredError();
-
   const primary = getConfig();
   // Optional per-request model override (used for image requests: the primary
   // text model may be text-only while LLM_VISION_MODEL handles the vision part).
   const primaryCfg = model ? { ...primary, model } : primary;
+  if (!hasAnyConfiguredProvider()) throw notConfiguredError();
   const retries = Math.max(0, Math.min(3, Number(maxRetries ?? DEFAULT_MAX_RETRIES)));
   const reqTag = requestId ? `requestId=${requestId} ` : '';
   // Caller-computed budget, capped at the absolute ceiling.
@@ -1114,8 +1246,42 @@ const requestCompletion = async ({
   // Safe provider-status diagnostics (§9): names only, never keys/auth material.
   if (DEV_LOG) console.log(`[AI] Primary provider: ${providerLabel(cfg.provider)}`);
 
-  const attempt = (target, options) =>
-    runWithProviderSlot(target.provider, () => attemptWithProvider(target, options), abortSignal);
+  const attempt = async (target, options) => {
+    const configIssue = providers.configurationIssue(target);
+    if (configIssue) {
+      return {
+        ok: false,
+        error: providerConfigurationError(target, configIssue),
+        attempts: 0,
+        attemptUsable: false,
+      };
+    }
+    if (!providers.isConfigured(target)) {
+      return {
+        ok: false,
+        error: notConfiguredError(),
+        attempts: 0,
+        attemptUsable: false,
+      };
+    }
+    const circuit = activeProviderCircuit(target);
+    if (circuit) {
+      return {
+        ok: false,
+        error: providerCircuitError(target, circuit),
+        attempts: 0,
+        attemptUsable: false,
+      };
+    }
+    const result = await runWithProviderSlot(
+      target.provider,
+      () => attemptWithProvider(target, options),
+      abortSignal
+    );
+    if (result.ok) clearProviderCircuit(target);
+    else recordProviderFailure(target, result.error);
+    return result;
+  };
 
   const first = await attempt(cfg, {
     messages,
@@ -1160,7 +1326,7 @@ const requestCompletion = async ({
         messages,
         temperature,
         maxTokens: budget,
-        retries: Math.min(1, retries),
+        retries: 0,
         tools,
         toolChoice,
         requestId,
@@ -1172,7 +1338,14 @@ const requestCompletion = async ({
         aiLog({ requestId, provider: fb.provider, model: fb.model, status: 200, durationMs: fallbackAttempt.value.durationMs, attempts: fallbackAttempt.value.attempts, category: 'OK' });
         return fallbackAttempt.value;
       }
-      chainAttempts.push({ cfg: fb, attempt: fallbackAttempt });
+      const fallbackTargets = providers.diagnosticTargets().filter((target) =>
+        target.slot !== 'primary' && target.configured
+      );
+      chainAttempts.push({
+        cfg: fb,
+        attempt: fallbackAttempt,
+        slot: fallbackTargets[i] ? fallbackTargets[i].slot : '',
+      });
       chainErr = fallbackAttempt.error || chainErr;
       if (DEV_LOG) {
         const kind = fallbackAttempt.error && fallbackAttempt.error.rateLimitKind === 'daily' ? 'quota exceeded' : 'unavailable';
@@ -1209,21 +1382,48 @@ const requestCompletion = async ({
       tooLarge.usedFallback = true; // lets chatWithBrowserSearch degrade to a plain answer
       throw tooLarge;
     }
-    // The whole configured chain (primary + every fallback) failed. Surface ONE
-    // calm, exact message regardless of the individual causes — an outage, a
-    // spent daily allowance and a per-minute limit are indistinguishable to the
-    // user, and every raw provider body/name stays server-side. A quota failure
-    // anywhere in the chain is never retryable (the allowance cannot come back
-    // inside this request); otherwise retryable only if every failure could
-    // recover.
+    // The whole configured chain (primary + every fallback) failed. Keep the
+    // standard lead message, then append only safe provider/category summaries.
+    // Raw provider response bodies remain server-side and are never logged or
+    // returned. A quota failure anywhere in the chain is never retryable; other
+    // failures are retryable only if every provider failure could recover.
+    const failureDetails = [
+      safeProviderFailure(
+        cfg,
+        first.error,
+        cfg.provider === primaryCfg.provider && cfg.model === primaryCfg.model
+          ? 'primary'
+          : (providers.diagnosticTargets().find((target) =>
+            target.configured && target.provider === cfg.provider && target.model === cfg.model
+          ) || {}).slot || ''
+      ),
+      ...chainAttempts.map((x) => safeProviderFailure(x.cfg, x.attempt.error, x.slot)),
+    ];
+    const attemptedSlots = new Set(failureDetails.map((failure) => failure.provider));
+    const missingTargets = providers.diagnosticTargets().filter((target) =>
+      target.slot !== 'primary' && target.declared && !target.configured &&
+      !attemptedSlots.has(target.provider)
+    );
+    for (const target of missingTargets) {
+      failureDetails.push({
+        provider: target.provider,
+        model: target.model,
+        category: 'missing_api_key',
+        reason: 'API key missing',
+        httpStatus: null,
+        rateLimitKind: '',
+        missingKeyVariable: target.missingKeyVariable,
+      });
+    }
     const allFailed = apiError(
-      ALL_PROVIDERS_FAILED_MESSAGE,
+      allProvidersFailureMessage(failureDetails),
       502,
       'AI_PROVIDERS_UNAVAILABLE',
       `${reqTag}(${triedNames.map((n, i) => `provider "${n}" failed with ${triedCodes[i]}`).join('; ')})`
     );
     allFailed.retryable = allRecoverable && !dailyInvolved;
     allFailed.usedFallback = true; // lets chatWithBrowserSearch degrade to plain chat
+    allFailed.providerFailures = failureDetails;
     throw allFailed;
   }
 
@@ -1333,7 +1533,7 @@ const chatWithBrowserSearch = async ({
   maxRetries,
   requestId = '',
 }) => {
-  if (!isConfigured()) throw notConfiguredError();
+  if (!hasAnyConfiguredProvider()) throw notConfiguredError();
   if (!supportsBrowserSearch()) {
     // Not a Groq endpoint: run the plain chat instead (still real, registry-grounded).
     const r = await chat({ messages, temperature, maxTokens, maxRetries, requestId, returnMeta: true });
@@ -1653,6 +1853,148 @@ const providerStatus = () => {
   };
 };
 
+const safeProviderBaseUrl = (value) => {
+  try {
+    const url = new URL(String(value || ''));
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return '';
+  }
+};
+
+const providerDiagnosticKey = (target) =>
+  `${target.slot}|${target.provider}|${target.model}`;
+
+const getProviderDiagnostics = () => providers.diagnosticTargets().map((target) => {
+  const last = providerInferenceDiagnostics.get(providerDiagnosticKey(target)) || null;
+  const circuit = target.configured ? activeProviderCircuit(target) : null;
+  return {
+    slot: target.slot,
+    provider: target.provider,
+    model: target.model,
+    baseUrl: safeProviderBaseUrl(target.baseUrl),
+    configurationStatus: target.configured ? 'configured' : 'missing_api_key',
+    apiKeySource: target.apiKeySource || '',
+    missingKeyVariable: target.missingKeyVariable || '',
+    lastInferenceStatus: last ? last.status : 'not_tested',
+    httpStatusCategory: last ? last.httpStatusCategory : '',
+    httpStatus: last ? last.httpStatus : null,
+    responseLatencyMs: last ? last.responseLatencyMs : null,
+    rateLimitStatus: last ? last.rateLimitStatus : 'unknown',
+    lastErrorCategory: last ? last.lastErrorCategory : '',
+    lastTestedAt: last ? last.lastTestedAt : null,
+    circuit: circuit
+      ? { status: 'open', openUntil: new Date(circuit.openUntil).toISOString(), category: providerErrorCategory(circuit) }
+      : { status: 'closed', openUntil: null, category: '' },
+  };
+});
+
+const runProviderDiagnostics = async () => {
+  if (providerDiagnosticRunPromise) return providerDiagnosticRunPromise;
+  if (
+    providerDiagnosticLastRunAt &&
+    Date.now() - providerDiagnosticLastRunAt < PROVIDER_DIAGNOSTIC_COOLDOWN_MS
+  ) {
+    return {
+      cached: true,
+      lastRunAt: new Date(providerDiagnosticLastRunAt).toISOString(),
+      providers: getProviderDiagnostics(),
+    };
+  }
+
+  providerDiagnosticLastRunAt = Date.now();
+  providerDiagnosticRunPromise = (async () => {
+    for (const target of providers.diagnosticTargets()) {
+      const testedAt = new Date().toISOString();
+      const config = target.slot === 'primary'
+        ? providers.primary()
+        : target.slot === 'fallback1'
+          ? providers.fallback()
+          : providers.fallback2();
+      const configIssue = config ? providers.configurationIssue(config) : '';
+
+      if (!target.configured || !config) {
+        providerInferenceDiagnostics.set(providerDiagnosticKey(target), {
+          status: 'not_configured',
+          httpStatusCategory: 'missing_api_key',
+          httpStatus: null,
+          responseLatencyMs: 0,
+          rateLimitStatus: 'not_tested',
+          lastErrorCategory: 'missing_api_key',
+          lastTestedAt: testedAt,
+        });
+        continue;
+      }
+
+      if (configIssue) {
+        const error = providerConfigurationError(config, configIssue);
+        providerInferenceDiagnostics.set(providerDiagnosticKey(target), {
+          status: 'failure',
+          httpStatusCategory: 'configuration',
+          httpStatus: null,
+          responseLatencyMs: 0,
+          rateLimitStatus: 'none',
+          lastErrorCategory: 'configuration',
+          lastTestedAt: testedAt,
+        });
+        recordProviderFailure(config, error);
+        continue;
+      }
+
+      const result = await runWithProviderSlot(config.provider, () => attemptWithProvider(config, {
+        messages: [
+          { role: 'system', content: 'Reply with the single word OK.' },
+          { role: 'user', content: 'Provider inference diagnostic.' },
+        ],
+        temperature: 0,
+        maxTokens: 128,
+        retries: 0,
+        requestId: '',
+      }));
+
+      if (result.ok) {
+        clearProviderCircuit(config);
+        providerInferenceDiagnostics.set(providerDiagnosticKey(target), {
+          status: 'success',
+          httpStatusCategory: 'success',
+          httpStatus: 200,
+          responseLatencyMs: result.value.durationMs,
+          rateLimitStatus: 'none',
+          lastErrorCategory: '',
+          lastTestedAt: testedAt,
+        });
+      } else {
+        recordProviderFailure(config, result.error);
+        providerInferenceDiagnostics.set(providerDiagnosticKey(target), {
+          status: 'failure',
+          httpStatusCategory: providerErrorCategory(result.error),
+          httpStatus: Number(result.error && result.error.providerHttpStatus) || null,
+          responseLatencyMs: Number(result.lastAttemptDurationMs) || 0,
+          rateLimitStatus: result.error && result.error.rateLimitKind === 'daily'
+            ? 'daily_quota_exhausted'
+            : result.error && result.error.code === 'AI_RATE_LIMITED'
+              ? 'rate_limited'
+              : 'none',
+          lastErrorCategory: providerErrorCategory(result.error),
+          lastTestedAt: testedAt,
+        });
+      }
+    }
+
+    return {
+      cached: false,
+      lastRunAt: new Date(providerDiagnosticLastRunAt).toISOString(),
+      providers: getProviderDiagnostics(),
+    };
+  })();
+
+  try {
+    return await providerDiagnosticRunPromise;
+  } finally {
+    providerDiagnosticRunPromise = null;
+  }
+};
+
 /** Safe startup diagnostics. NEVER includes the API key. */
 const describe = () => {
   const p = providers.describe();
@@ -1669,6 +2011,7 @@ const describe = () => {
     fallback1Configured: p.fallback1Configured,
     fallback2Declared: p.fallback2Declared,
     fallback2Configured: p.fallback2Configured,
+    diagnosticTargets: p.diagnosticTargets,
     vision: p.vision,
   };
 };
@@ -1690,6 +2033,9 @@ module.exports = {
   probeStatus,
   probeErrorCategory,
   doProbe,
+  getProviderDiagnostics,
+  runProviderDiagnostics,
+  resetProviderCircuits: () => providerCircuits.clear(),
   describe,
   // Budget/timeout introspection (used by the deterministic budget tests).
   perAttemptTimeoutMs,

@@ -158,6 +158,7 @@ global.fetch = async (url, init) => {
 /** One llmService.chat run against `respond`. Returns the error, the answer,
  *  exactly how many provider fetches were made, and the log lines it produced. */
 const runChat = async ({ respond, maxRetries = 2, maxTokens = 64, requestId = 'offline-test-rid' }) => {
+  llmService.resetProviderCircuits();
   fetchCalls = [];
   responder = respond;
   const mark = captured.length;
@@ -380,7 +381,7 @@ const main = async () => {
 
     const bothFail = await runChat({ respond: () => http(429, BODY_TPD) });
     ok('when BOTH providers fail the surfaced code is AI_PROVIDERS_UNAVAILABLE (§10)', bothFail.error && bothFail.error.code === 'AI_PROVIDERS_UNAVAILABLE', bothFail.error ? bothFail.error.code : '');
-    ok('the exact all-fail message is surfaced (never a provider name or raw body)', !!bothFail.error && bothFail.error.message === 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.', bothFail.error ? bothFail.error.message.slice(0, 80) : '');
+    ok('the all-fail message includes safe provider-specific categories, not raw bodies', !!bothFail.error && bothFail.error.message.startsWith('All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.') && /Groq: daily quota exhausted/.test(bothFail.error.message), bothFail.error ? bothFail.error.message.slice(0, 180) : '');
     ok('a daily-involved both-fail stays retryable:false (no Retry is offered)', bothFail.error && bothFail.error.retryable === false, `retryable=${bothFail.error && bothFail.error.retryable}`);
     ok('the all-fail error is tagged usedFallback', bothFail.error && bothFail.error.usedFallback === true, `usedFallback=${bothFail.error && bothFail.error.usedFallback}`);
     ok('total calls stay at 1 primary + 1 fallback (no retry storm)', bothFail.calls.length === 2, `${bothFail.calls.length} call(s)`);
@@ -413,7 +414,7 @@ const main = async () => {
 
     const bothFail = await runChat({ respond: () => http(429, BODY_TPD) });
     ok('separate-key fallback also exhausted -> AI_PROVIDERS_UNAVAILABLE surfaces (§10)', bothFail.error && bothFail.error.code === 'AI_PROVIDERS_UNAVAILABLE', bothFail.error ? bothFail.error.code : '');
-    ok('the exact all-fail message is surfaced (never "temporarily unavailable")', !!bothFail.error && bothFail.error.message === 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.', bothFail.error ? bothFail.error.message.slice(0, 80) : '');
+    ok('the all-fail message includes safe provider categories, not "temporarily unavailable"', !!bothFail.error && bothFail.error.message.startsWith('All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.') && /OpenAI: daily quota exhausted/.test(bothFail.error.message), bothFail.error ? bothFail.error.message.slice(0, 180) : '');
     ok('a separate-key daily both-fail is NOT retryable', bothFail.error && bothFail.error.retryable === false, `retryable=${bothFail.error && bothFail.error.retryable}`);
 
     delete process.env.LLM_FALLBACK_PROVIDER;
@@ -482,14 +483,14 @@ const main = async () => {
     // ALL THREE providers daily-exhausted -> the ONE exact all-fail message.
     const allDaily = await runChat({ respond: () => http(429, BODY_TPD) });
     ok('all three daily-exhausted -> AI_PROVIDERS_UNAVAILABLE surfaces (§20)', allDaily.error && allDaily.error.code === 'AI_PROVIDERS_UNAVAILABLE', allDaily.error ? allDaily.error.code : '(no error)');
-    ok('the exact all-fail message names both outage and usage limits', !!allDaily.error && allDaily.error.message === 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.', allDaily.error ? allDaily.error.message.slice(0, 80) : '');
+    ok('all daily failures are named with safe quota categories', !!allDaily.error && allDaily.error.message.startsWith('All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.') && /Groq: daily quota exhausted/.test(allDaily.error.message) && /OpenAI: daily quota exhausted/.test(allDaily.error.message), allDaily.error ? allDaily.error.message.slice(0, 180) : '');
     ok('all-three daily is NOT retryable', allDaily.error && allDaily.error.retryable === false, `retryable=${allDaily.error && allDaily.error.retryable}`);
     ok('all-three daily is tagged as a fallback round (usedFallback)', allDaily.error && allDaily.error.usedFallback === true, `usedFallback=${allDaily.error && allDaily.error.usedFallback}`);
 
     // ALL THREE providers fail WITHOUT quota (503) -> the same exact wording.
     const allDown = await runChat({ respond: () => http(503, 'service unavailable') });
     ok('all three 503 -> AI_PROVIDERS_UNAVAILABLE (§20)', allDown.error && allDown.error.code === 'AI_PROVIDERS_UNAVAILABLE', allDown.error ? allDown.error.code : '(no error)');
-    ok('all-503 uses the exact all-fail wording', !!allDown.error && allDown.error.message === 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.', allDown.error ? allDown.error.message.slice(0, 80) : '');
+    ok('all-503 identifies each unavailable provider', !!allDown.error && allDown.error.message.startsWith('All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.') && /Groq: provider unavailable/.test(allDown.error.message), allDown.error ? allDown.error.message.slice(0, 180) : '');
     ok('all-503 stays retryable (every failure could recover)', allDown.error && allDown.error.retryable === true, `retryable=${allDown.error && allDown.error.retryable}`);
     ok('all-503 is tagged as a fallback round (usedFallback)', allDown.error && allDown.error.usedFallback === true, `usedFallback=${allDown.error && allDown.error.usedFallback}`);
     ok('every configured provider was tried at least once', allDown.calls.length >= 3, `${allDown.calls.length} call(s)`);
@@ -499,7 +500,7 @@ const main = async () => {
       maxRetries: 0,
     });
     ok('all providers failing before an HTTP response also surface AI_PROVIDERS_UNAVAILABLE', allNetworkDown.error && allNetworkDown.error.code === 'AI_PROVIDERS_UNAVAILABLE', allNetworkDown.error ? allNetworkDown.error.code : '(no error)');
-    ok('the all-network failure uses the exact all-fail wording', !!allNetworkDown.error && allNetworkDown.error.message === 'All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.', allNetworkDown.error ? allNetworkDown.error.message : '');
+    ok('the all-network failure identifies network errors safely', !!allNetworkDown.error && allNetworkDown.error.message.startsWith('All configured AI providers are currently unavailable or have reached their usage limits. Please try again later.') && /Groq: network connection failed/.test(allNetworkDown.error.message), allNetworkDown.error ? allNetworkDown.error.message : '');
     ok('an all-network failure remains retryable', allNetworkDown.error && allNetworkDown.error.retryable === true, `retryable=${allNetworkDown.error && allNetworkDown.error.retryable}`);
 
     // Incomplete slot 2 (provider declared, no own key) is EXCLUDED from the chain.
@@ -509,6 +510,7 @@ const main = async () => {
     process.env.LLM_FALLBACK2_API_KEY = 'sk-test-deepseek-key-not-real';
 
     // A continuation pinned to chain slot 2 goes straight there — one fetch.
+    llmService.resetProviderCircuits();
     fetchCalls = [];
     responder = () => okReply('PREFERRED ANSWER');
     const outSlot2 = await llmService.chat({
@@ -560,6 +562,7 @@ const main = async () => {
 
     fetchCalls = [];
     responder = () => okReply('PREFERRED ANSWER');
+    llmService.resetProviderCircuits();
     const out = await llmService.chat({
       messages: [{ role: 'user', content: 'continue the answer' }],
       maxTokens: 64,
@@ -575,6 +578,7 @@ const main = async () => {
     // damaged primary and never start another fallback round.
     const start = fetchCalls.length;
     responder = () => http(503, 'service unavailable');
+    llmService.resetProviderCircuits();
     const pinnedErr = await llmService.chat({
       messages: [{ role: 'user', content: 'continue' }],
       maxTokens: 64,
@@ -651,7 +655,7 @@ const main = async () => {
       res.set = () => res;
       return res;
     };
-    const send = async (requestId, message = 'hi') => {
+    const send = async (requestId, message = 'What is Java?') => {
       const res = makeRes();
       await aiController.careerAssistant({ body: { message, requestId }, user: { id: 'offline-test-user' } }, res);
       return res;
@@ -666,7 +670,7 @@ const main = async () => {
       const reqLog = captured.slice(mark).find((l) => /^\[AI REQUEST\]/.test(l)) || '';
       ok('[AI REQUEST] logs provider/model/kind/user/requestId (§12)', /^\[AI REQUEST\] provider=groq model=\S+ kind=text user=offline-test-user requestId=rid-offline-1$/.test(reqLog), reqLog || '(no [AI REQUEST] line)');
       const chatLog = captured.slice(mark).find((l) => /^\[CHAT REQUEST\]/.test(l)) || '';
-      ok('[CHAT REQUEST] trace logs requestId/provider and message length without chat content (§1)', /^\[CHAT REQUEST\] requestId=rid-offline-1 provider=groq messageChars=2$/.test(chatLog), chatLog || '(no [CHAT REQUEST] line)');
+      ok('[CHAT REQUEST] trace logs requestId/provider and message length without chat content (§1)', /^\[CHAT REQUEST\] requestId=rid-offline-1 provider=groq messageChars=13$/.test(chatLog), chatLog || '(no [CHAT REQUEST] line)');
 
       const dup = await send('rid-offline-1');
       ok('a duplicate requestId replays the SAME response', !!(dup.body && dup.body.success) && dup.body.deduped === true, `deduped=${dup.body && dup.body.deduped}`);
@@ -717,7 +721,7 @@ const main = async () => {
       legacy.indexOf('api === "AI_DAILY_LIMIT"') < legacy.indexOf('api === "AI_RATE_LIMITED"'));
     ok('Legacy: AI_DAILY_LIMIT is retryable:false', /api === "AI_DAILY_LIMIT"[\s\S]{0,500}?retryable: false/.test(legacy));
     ok('Legacy: all-providers-failed uses the exact all-fail wording', /api === "AI_PROVIDERS_UNAVAILABLE"[\s\S]{0,250}?All configured AI providers are currently unavailable or have reached their usage limits[\s\S]{0,40}?Please try again later\./.test(legacy));
-    ok('Legacy: all-providers-failed respects the backend retryable flag', /api === "AI_PROVIDERS_UNAVAILABLE"[\s\S]{0,400}?err\.retryable !== false/.test(legacy));
+    ok('Legacy: all-providers-failed respects the backend retryable flag', /api === "AI_PROVIDERS_UNAVAILABLE"[\s\S]{0,800}?err\.retryable !== false/.test(legacy));
     ok('Legacy: per-minute 429 stays retryable:true', /status === 429 \|\| api === "AI_RATE_LIMITED"[\s\S]{0,500}?retryable: true/.test(legacy));
     ok('Legacy: the Retry button is gated on m.retryable', /retryBtn = \(m\.retryable\)/.test(legacy));
     ok('Legacy: "unavailable" says the provider is temporarily unavailable', /The AI provider is temporarily unavailable\./.test(legacy));
